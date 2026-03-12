@@ -49,9 +49,11 @@ def extract_rich_desc(html):
         return ""
     items = re.findall(r"<li>(.*?)</li>", html, re.DOTALL)
     if items:
-        cleaned = [re.sub(r"<[^>]+>", "", item).strip() for item in items]
-        return " | ".join(cleaned)
-    return ""
+        cleaned = [re.sub(r"<[^>]+>", "", item).strip() for item in items if re.sub(r"<[^>]+>", "", item).strip()]
+        return ", ".join(cleaned)
+    # Fallback: strip all HTML tags
+    text = re.sub(r"<[^>]+>", "", html).strip()
+    return text
 
 
 def fix_price(val):
@@ -143,7 +145,7 @@ WARNING_STANDARD = (
 
 ACP_COLUMNS = [
     "is_eligible_search", "is_eligible_checkout",
-    "item_id", "gtin", "mpn", "title", "description", "url",
+    "item_id", "gtin", "mpn", "identifier_exists", "title", "description", "url",
     "brand", "condition", "product_category", "material",
     "dimensions", "length", "width", "height", "dimensions_unit",
     "weight", "item_weight_unit", "age_group",
@@ -203,8 +205,9 @@ def generate_acp(xlsx_bytes, log):
     stats["nouveaux"] = len(new_ids)
     log.append(f"+ {len(new_ids)} nouveaux produits")
 
-    # b) Retirer les absents
+    # b) Retirer les absents (garder dans un sheet separe)
     removed_ids = set(df["id"]) - set(dx["id"])
+    removed_df = df[df["id"].isin(removed_ids)].copy() if removed_ids else pd.DataFrame()
     if removed_ids:
         df = df[~df["id"].isin(removed_ids)].reset_index(drop=True)
     stats["retires"] = len(removed_ids)
@@ -283,11 +286,11 @@ def generate_acp(xlsx_bytes, log):
     }
     df.rename(columns=rename_map, inplace=True)
 
-    # Enrichir descriptions
+    # Enrichir descriptions : description + "Ses principaux bienfaits : " + rich_text
     mask = (df["description"] == "") & (df["_rich_desc"] != "")
-    df.loc[mask, "description"] = df.loc[mask, "_rich_desc"]
+    df.loc[mask, "description"] = "Ses principaux bienfaits : " + df.loc[mask, "_rich_desc"]
     mask2 = (df["description"] != "") & (df["_rich_desc"] != "")
-    df.loc[mask2, "description"] = df.loc[mask2, "description"] + " — " + df.loc[mask2, "_rich_desc"]
+    df.loc[mask2, "description"] = df.loc[mask2, "description"] + " Ses principaux bienfaits : " + df.loc[mask2, "_rich_desc"]
 
     # Category fallback
     if "_xlsx_category" in df.columns and "product_category" in df.columns:
@@ -424,6 +427,10 @@ def generate_acp(xlsx_bytes, log):
         if tmp in df.columns:
             df.drop(columns=[tmp], inplace=True)
 
+    # identifier_exists en fonction du gtin
+    if "gtin" in df.columns:
+        df["identifier_exists"] = df["gtin"].apply(lambda g: "true" if g and g.strip() else "false")
+
     # Ordonner les 77 colonnes
     for col in ACP_COLUMNS:
         if col not in df.columns:
@@ -432,7 +439,7 @@ def generate_acp(xlsx_bytes, log):
 
     stats["total"] = len(df)
     log.append(f"= {len(df)} produits, {len(df.columns)} colonnes")
-    return df, stats
+    return df, stats, removed_df
 
 
 def generate_gmc(xlsx_bytes, log):
@@ -476,8 +483,9 @@ def generate_gmc(xlsx_bytes, log):
     stats["nouveaux"] = len(new_ids)
     log.append(f"GMC: + {len(new_ids)} nouveaux produits")
 
-    # b) Retirer absents
+    # b) Retirer absents (garder dans un sheet separe)
     removed_ids = set(gmc["id"]) - set(dx["id"])
+    gmc_removed_df = gmc[gmc["id"].isin(removed_ids)].copy() if removed_ids else pd.DataFrame()
     if removed_ids:
         gmc = gmc[~gmc["id"].isin(removed_ids)].reset_index(drop=True)
     stats["retires"] = len(removed_ids)
@@ -522,6 +530,19 @@ def generate_gmc(xlsx_bytes, log):
     if "sale price" in gmc.columns:
         gmc.loc[common_mask, "sale price"] = new_sale.where(new_sale != "", gmc.loc[common_mask, "sale price"]).values
 
+    # Description enrichie : description + "Ses principaux bienfaits : " + rich_text
+    if "description" in gmc.columns:
+        rich_descs = common_ids.map(
+            lambda i: extract_rich_desc(dx_idx.loc[i, "rich_text_description"])
+            if "rich_text_description" in dx_idx.columns and dx_idx.loc[i, "rich_text_description"] else ""
+        )
+        mask_empty = (gmc.loc[common_mask, "description"] == "") & (rich_descs != "")
+        gmc.loc[common_mask & mask_empty.values, "description"] = "Ses principaux bienfaits : " + rich_descs[mask_empty].values
+        mask_both = (gmc.loc[common_mask, "description"] != "") & (rich_descs != "") & (~mask_empty)
+        if mask_both.any():
+            idxs = common_mask & mask_both.values
+            gmc.loc[idxs, "description"] = gmc.loc[idxs, "description"] + " Ses principaux bienfaits : " + rich_descs[mask_both].values
+
     # GTIN from barcodes
     barcodes = extract_barcodes()
     if barcodes and "gtin" in gmc.columns:
@@ -535,9 +556,13 @@ def generate_gmc(xlsx_bytes, log):
                 if sku in barcodes and not gmc.at[idx, "gtin"]:
                     gmc.at[idx, "gtin"] = barcodes[sku]
 
+    # identifier exists en fonction du gtin
+    if "gtin" in gmc.columns and "identifier exists" in gmc.columns:
+        gmc["identifier exists"] = gmc["gtin"].apply(lambda g: "yes" if g and g.strip() else "no")
+
     stats["total"] = len(gmc)
     log.append(f"GMC: = {len(gmc)} produits, {len(gmc.columns)} colonnes")
-    return gmc, stats
+    return gmc, stats, gmc_removed_df
 
 
 # ============================================================
@@ -669,6 +694,28 @@ st.markdown("""
         color: #1A1A1A !important;
     }
 
+    /* Primary button */
+    .stButton > button[kind="primary"],
+    .stButton > button[data-testid="stBaseButton-primary"] {
+        background-color: #89B832 !important;
+        border-color: #89B832 !important;
+        color: white !important;
+    }
+    .stButton > button[kind="primary"]:hover,
+    .stButton > button[data-testid="stBaseButton-primary"]:hover {
+        background-color: #7aa52b !important;
+        border-color: #7aa52b !important;
+    }
+
+    /* Download buttons */
+    .stDownloadButton > button {
+        border-color: #89B832 !important;
+        color: #89B832 !important;
+    }
+    .stDownloadButton > button:hover {
+        background-color: #f3fbe8 !important;
+    }
+
     /* Header */
     .calebasse-header {
         border-bottom: 3px solid #89B832;
@@ -794,10 +841,25 @@ if page == "Importer le fichier Export ERP":
             gmc_log = []
 
             with st.spinner("Generation du feed ACP OpenAI..."):
-                acp_df, acp_stats = generate_acp(xlsx_bytes, acp_log)
+                acp_df, acp_stats, acp_removed = generate_acp(xlsx_bytes, acp_log)
 
             with st.spinner("Generation du feed Google Merchant Center..."):
-                gmc_df, gmc_stats = generate_gmc(xlsx_bytes, gmc_log)
+                gmc_df, gmc_stats, gmc_removed = generate_gmc(xlsx_bytes, gmc_log)
+
+            # Sauvegarder automatiquement en local
+            acp_path = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
+            acp_df.to_csv(acp_path, index=False, encoding="utf-8")
+            acp_log.append(f"Sauvegarde : {acp_path}")
+
+            gmc_files = glob.glob(GMC_PATTERN)
+            if gmc_files and gmc_df is not None:
+                with pd.ExcelWriter(gmc_files[0], engine="openpyxl") as writer:
+                    gmc_df.to_excel(writer, sheet_name="Products", index=False)
+                    if not gmc_removed.empty:
+                        gmc_removed.to_excel(writer, sheet_name="Retires", index=False)
+                gmc_log.append(f"Sauvegarde : {gmc_files[0]}")
+                if not gmc_removed.empty:
+                    gmc_log.append(f"  + {len(gmc_removed)} produits retires dans l'onglet 'Retires'")
 
             # Store in session state for persistence
             st.session_state["acp_df"] = acp_df
@@ -806,6 +868,8 @@ if page == "Importer le fichier Export ERP":
             st.session_state["gmc_stats"] = gmc_stats
             st.session_state["acp_log"] = acp_log
             st.session_state["gmc_log"] = gmc_log
+            st.session_state["acp_removed"] = acp_removed
+            st.session_state["gmc_removed"] = gmc_removed
             st.session_state["generated"] = True
 
         # --- Display results if generated ---
@@ -816,8 +880,10 @@ if page == "Importer le fichier Export ERP":
             gmc_stats = st.session_state["gmc_stats"]
             acp_log = st.session_state["acp_log"]
             gmc_log = st.session_state["gmc_log"]
+            acp_removed = st.session_state.get("acp_removed", pd.DataFrame())
+            gmc_removed = st.session_state.get("gmc_removed", pd.DataFrame())
 
-            st.markdown('<div class="success-box">Mise a jour terminee avec succes</div>', unsafe_allow_html=True)
+            st.markdown('<div class="success-box">Mise a jour terminee — fichiers sauvegardes automatiquement</div>', unsafe_allow_html=True)
 
             # --- Stats ---
             st.markdown('<h2 class="section-title">Resultats</h2>', unsafe_allow_html=True)
@@ -865,7 +931,12 @@ if page == "Importer le fichier Export ERP":
             # ============================
             st.markdown('<h2 class="section-title">Apercu des donnees generees</h2>', unsafe_allow_html=True)
 
-            tab_acp, tab_gmc = st.tabs(["ACP OpenAI Feed", "Google Merchant Center"])
+            tab_names = ["ACP OpenAI Feed", "Google Merchant Center"]
+            if not gmc_removed.empty:
+                tab_names.append(f"Produits retires ({len(gmc_removed)})")
+            tabs = st.tabs(tab_names)
+            tab_acp = tabs[0]
+            tab_gmc = tabs[1]
 
             # --- ACP Preview Tab ---
             with tab_acp:
@@ -970,6 +1041,14 @@ if page == "Importer le fichier Export ERP":
                 else:
                     st.warning("Fichier GMC non genere")
 
+            # --- Tab Retires ---
+            if not gmc_removed.empty and len(tabs) > 2:
+                with tabs[2]:
+                    st.markdown(f"**{len(gmc_removed)} produits retires** (presents dans GMC/ACP mais absents de l'export ERP)")
+                    default_ret = ["id", "title", "price", "availability", "gtin", "brand"]
+                    avail_ret = [c for c in default_ret if c in gmc_removed.columns]
+                    st.dataframe(gmc_removed[avail_ret] if avail_ret else gmc_removed, width="stretch", height=450)
+
             st.markdown("---")
 
             # ============================
@@ -991,7 +1070,10 @@ if page == "Importer le fichier Export ERP":
             with dl2:
                 if gmc_df is not None:
                     gmc_buffer = io.BytesIO()
-                    gmc_df.to_excel(gmc_buffer, index=False, engine="openpyxl")
+                    with pd.ExcelWriter(gmc_buffer, engine="openpyxl") as writer:
+                        gmc_df.to_excel(writer, sheet_name="Products", index=False)
+                        if not gmc_removed.empty:
+                            gmc_removed.to_excel(writer, sheet_name="Retires", index=False)
                     gmc_buffer.seek(0)
                     st.download_button(
                         label="Flux Google Merchant Center.xlsx",
@@ -1001,17 +1083,6 @@ if page == "Importer le fichier Export ERP":
                         width="stretch",
                     )
 
-            # Save locally
-            st.markdown("---")
-            if st.button("Sauvegarder en local", type="secondary", width="stretch"):
-                acp_path = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
-                acp_df.to_csv(acp_path, index=False, encoding="utf-8")
-
-                gmc_files = glob.glob(GMC_PATTERN)
-                if gmc_files and gmc_df is not None:
-                    gmc_df.to_excel(gmc_files[0], index=False, engine="openpyxl")
-
-                st.success(f"Fichiers sauvegardes dans {BASE_DIR}")
 
     else:
         st.info("Importez un fichier export-variants (.xlsx) pour commencer")
