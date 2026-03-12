@@ -50,10 +50,10 @@ def extract_rich_desc(html):
     items = re.findall(r"<li>(.*?)</li>", html, re.DOTALL)
     if items:
         cleaned = [re.sub(r"<[^>]+>", "", item).strip() for item in items if re.sub(r"<[^>]+>", "", item).strip()]
-        return ", ".join(cleaned)
+        return ", ".join(cleaned).lower()
     # Fallback: strip all HTML tags
     text = re.sub(r"<[^>]+>", "", html).strip()
-    return text
+    return text.lower()
 
 
 def fix_price(val):
@@ -189,6 +189,16 @@ def generate_acp(xlsx_bytes, log):
     new_ids = set(dx["id"]) - set(df["id"])
     if new_ids:
         new_rows = dx[dx["id"].isin(new_ids)].copy()
+        # Enrichir descriptions des nouveaux produits avant renommage
+        if "rich_text_description" in new_rows.columns:
+            for idx in new_rows.index:
+                rich = extract_rich_desc(new_rows.at[idx, "rich_text_description"])
+                if rich:
+                    base = new_rows.at[idx, "description"].strip()
+                    if base:
+                        new_rows.at[idx, "description"] = base + " Ses principaux bienfaits : " + rich
+                    else:
+                        new_rows.at[idx, "description"] = "Ses principaux bienfaits : " + rich
         new_rows.rename(columns={
             "url": "link", "image_link": "image link",
             "additional_image_link": "additional image link",
@@ -199,6 +209,7 @@ def generate_acp(xlsx_bytes, log):
                 new_rows[col] = ""
         new_rows["brand"] = "Laboratoire Calebasse"
         new_rows["condition"] = "new"
+        new_rows["title"] = new_rows["title"].apply(lambda t: " ".join(t.split()))
         avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "preorder"}
         new_rows["availability"] = new_rows["availability"].map(avail_map).fillna("out_of_stock")
         df = pd.concat([df, new_rows[df.columns]], ignore_index=True)
@@ -224,11 +235,15 @@ def generate_acp(xlsx_bytes, log):
     stats["disponibilites"] = changed_avail
     log.append(f"~ {changed_avail} disponibilites mises a jour")
 
-    new_titles = common_ids.map(lambda i: dx_idx.loc[i, "title"].strip().rstrip("\n"))
+    new_titles = common_ids.map(lambda i: " ".join(dx_idx.loc[i, "title"].split()))
     changed_titles = int((df.loc[common_mask, "title"] != new_titles).sum())
     df.loc[common_mask, "title"] = new_titles.values
     stats["titres"] = changed_titles
     log.append(f"~ {changed_titles} titres mis a jour")
+
+    # Description de base (avant enrichissement)
+    new_descs = common_ids.map(lambda i: dx_idx.loc[i, "description"].strip() if dx_idx.loc[i, "description"] else "")
+    df.loc[common_mask, "description"] = new_descs.where(new_descs != "", df.loc[common_mask, "description"]).values
 
     new_imgs = common_ids.map(lambda i: dx_idx.loc[i, "image_link"].strip() if dx_idx.loc[i, "image_link"] else "")
     changed_imgs = int(((new_imgs != "") & (df.loc[common_mask, "image link"] != new_imgs)).sum())
@@ -261,10 +276,11 @@ def generate_acp(xlsx_bytes, log):
                 lambda i: dx_idx.loc[i, "shipping_weight"].strip() if i in dx_idx.index and dx_idx.loc[i, "shipping_weight"] else ""
             ).values
 
-    # Rich text description
+    # Rich text description (compatible 12 ou 13 colonnes)
     df["_rich_desc"] = ""
-    rich_descs = common_ids.map(lambda i: extract_rich_desc(dx_idx.loc[i, "rich_text_description"]) if dx_idx.loc[i, "rich_text_description"] else "")
-    df.loc[common_mask, "_rich_desc"] = rich_descs.values
+    if "rich_text_description" in dx_idx.columns:
+        rich_descs = common_ids.map(lambda i: extract_rich_desc(dx_idx.loc[i, "rich_text_description"]) if dx_idx.loc[i, "rich_text_description"] else "")
+        df.loc[common_mask, "_rich_desc"] = rich_descs.values
 
     # Category
     df["_xlsx_category"] = ""
@@ -461,20 +477,33 @@ def generate_gmc(xlsx_bytes, log):
     new_ids = set(dx["id"]) - set(gmc["id"])
     if new_ids:
         new_rows = dx[dx["id"].isin(new_ids)].copy()
-        new_rows.rename(columns={
+        # Enrichir descriptions des nouveaux produits avant renommage
+        if "rich_text_description" in new_rows.columns:
+            for idx in new_rows.index:
+                rich = extract_rich_desc(new_rows.at[idx, "rich_text_description"])
+                if rich:
+                    base = new_rows.at[idx, "description"].strip()
+                    if base:
+                        new_rows.at[idx, "description"] = base + " Ses principaux bienfaits : " + rich
+                    else:
+                        new_rows.at[idx, "description"] = "Ses principaux bienfaits : " + rich
+        rename_cols = {
             "url": "link", "image_link": "image link",
             "additional_image_link": "additional image link",
             "item_group_id": "item group id",
             "sale_price": "sale price",
             "shipping_weight": "shipping_weight_tmp",
-            "rich_text_description": "rich_text_tmp",
             "category": "category_tmp",
-        }, inplace=True)
+        }
+        if "rich_text_description" in new_rows.columns:
+            rename_cols["rich_text_description"] = "rich_text_tmp"
+        new_rows.rename(columns=rename_cols, inplace=True)
         for col in gmc.columns:
             if col not in new_rows.columns:
                 new_rows[col] = ""
         new_rows["brand"] = "Laboratoire Calebasse"
         new_rows["condition"] = "new"
+        new_rows["title"] = new_rows["title"].apply(lambda t: " ".join(t.split()))
         new_rows["identifier exists"] = "no"
         new_rows["adult"] = "no"
         avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "preorder"}
@@ -502,11 +531,15 @@ def generate_gmc(xlsx_bytes, log):
     stats["disponibilites"] = changed_avail
     log.append(f"GMC: ~ {changed_avail} disponibilites")
 
-    new_titles = common_ids.map(lambda i: dx_idx.loc[i, "title"].strip().rstrip("\n"))
+    new_titles = common_ids.map(lambda i: " ".join(dx_idx.loc[i, "title"].split()))
     changed_titles = int((gmc.loc[common_mask, "title"] != new_titles).sum())
     gmc.loc[common_mask, "title"] = new_titles.values
     stats["titres"] = changed_titles
     log.append(f"GMC: ~ {changed_titles} titres")
+
+    # Description de base (avant enrichissement)
+    new_descs = common_ids.map(lambda i: dx_idx.loc[i, "description"].strip() if dx_idx.loc[i, "description"] else "")
+    gmc.loc[common_mask, "description"] = new_descs.where(new_descs != "", gmc.loc[common_mask, "description"]).values
 
     new_imgs = common_ids.map(lambda i: dx_idx.loc[i, "image_link"].strip() if dx_idx.loc[i, "image_link"] else "")
     gmc.loc[common_mask, "image link"] = new_imgs.where(new_imgs != "", gmc.loc[common_mask, "image link"]).values
@@ -526,15 +559,16 @@ def generate_gmc(xlsx_bytes, log):
     new_prices = common_ids.map(lambda i: dx_idx.loc[i, "price"].strip() if dx_idx.loc[i, "price"] else "")
     gmc.loc[common_mask, "price"] = new_prices.where(new_prices != "", gmc.loc[common_mask, "price"]).values
 
-    new_sale = common_ids.map(lambda i: dx_idx.loc[i, "sale_price"].strip() if "sale_price" in dx_idx.columns and dx_idx.loc[i, "sale_price"] else "")
-    if "sale price" in gmc.columns:
-        gmc.loc[common_mask, "sale price"] = new_sale.where(new_sale != "", gmc.loc[common_mask, "sale price"]).values
+    # Sale price : ERP fait autorite (ecrase meme si vide pour retirer les promos expirees)
+    if "sale_price" in dx_idx.columns and "sale price" in gmc.columns:
+        new_sale = common_ids.map(lambda i: dx_idx.loc[i, "sale_price"].strip() if dx_idx.loc[i, "sale_price"] else "")
+        gmc.loc[common_mask, "sale price"] = new_sale.values
 
     # Description enrichie : description + "Ses principaux bienfaits : " + rich_text
-    if "description" in gmc.columns:
+    if "description" in gmc.columns and "rich_text_description" in dx_idx.columns:
         rich_descs = common_ids.map(
             lambda i: extract_rich_desc(dx_idx.loc[i, "rich_text_description"])
-            if "rich_text_description" in dx_idx.columns and dx_idx.loc[i, "rich_text_description"] else ""
+            if dx_idx.loc[i, "rich_text_description"] else ""
         )
         mask_empty = (gmc.loc[common_mask, "description"] == "") & (rich_descs != "")
         gmc.loc[common_mask & mask_empty.values, "description"] = "Ses principaux bienfaits : " + rich_descs[mask_empty].values
