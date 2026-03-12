@@ -10,6 +10,7 @@ import json
 import os
 import glob
 import io
+import hashlib
 from datetime import datetime
 
 # --- Configuration ---
@@ -681,6 +682,49 @@ st.set_page_config(
     layout="wide",
 )
 
+# ============================================================
+# AUTHENTIFICATION
+# ============================================================
+USERS = {
+    "admin": hashlib.sha256("Calebasse2026!".encode()).hexdigest(),
+    "calebasse": hashlib.sha256("feeds@Lab".encode()).hexdigest(),
+}
+
+def check_login():
+    if st.session_state.get("authenticated"):
+        return True
+    st.markdown("""
+    <style>
+        [data-testid="stSidebar"] { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        st.markdown("""
+        <div style="text-align:center;margin-top:60px;margin-bottom:30px;">
+            <h1 style="font-family:Georgia,serif;color:#89B832;font-size:36px;margin:0;">Laboratoire Calebasse</h1>
+            <p style="color:#666;font-style:italic;font-size:14px;margin:6px 0 0;">Gestion des feeds produits</p>
+        </div>
+        """, unsafe_allow_html=True)
+        with st.form("login_form"):
+            st.markdown('<p style="font-size:15px;font-weight:600;color:#1A1A1A;margin-bottom:4px;">Connexion</p>', unsafe_allow_html=True)
+            username = st.text_input("Identifiant")
+            password = st.text_input("Mot de passe", type="password")
+            submitted = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
+            if submitted:
+                pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+                if username in USERS and USERS[username] == pwd_hash:
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username
+                    st.rerun()
+                else:
+                    st.error("Identifiant ou mot de passe incorrect")
+        st.markdown('<div style="text-align:center;margin-top:40px;font-size:12px;color:#bbb;">Laboratoire Calebasse &copy; 2026</div>', unsafe_allow_html=True)
+    return False
+
+if not check_login():
+    st.stop()
+
 # --- Calebasse Design System (CSS complement au theme config.toml) ---
 st.markdown("""
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
@@ -833,6 +877,12 @@ with st.sidebar:
     st.markdown("**Fichiers detectes**")
     st.markdown(f"{'&#9989;' if acp_exists else '&#10060;'} ACP Feed", unsafe_allow_html=True)
     st.markdown(f"{'&#9989;' if gmc_exists else '&#10060;'} GMC Feed", unsafe_allow_html=True)
+    st.markdown("---")
+    st.caption(f"Connecte : **{st.session_state.get('username', '')}**")
+    if st.button("Deconnexion", key="logout"):
+        st.session_state["authenticated"] = False
+        st.session_state["username"] = ""
+        st.rerun()
 
 # --- Header ---
 st.markdown("""
@@ -1147,108 +1197,221 @@ elif page == "Apercu des fichiers actuels":
         else:
             st.warning("GMC XLSX introuvable")
 
+    # Download buttons
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        if os.path.exists(acp_path):
+            acp_data = acp_full.to_csv(index=False, encoding="utf-8")
+            st.download_button(
+                label="Telecharger ACP_OpenAI_Feed.csv",
+                data=acp_data,
+                file_name="ACP_OpenAI_Feed.csv",
+                mime="text/csv",
+                key="dl_acp_apercu",
+            )
+    with dl2:
+        if gmc_path:
+            gmc_buf = io.BytesIO()
+            with pd.ExcelWriter(gmc_buf, engine="openpyxl") as writer:
+                gmc.to_excel(writer, sheet_name="Products", index=False)
+            st.download_button(
+                label="Telecharger GMC.xlsx",
+                data=gmc_buf.getvalue(),
+                file_name=os.path.basename(gmc_path),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_gmc_apercu",
+            )
+
     st.markdown("---")
-    st.markdown('<h2 class="section-title">Apercu des fichiers actuels</h2>', unsafe_allow_html=True)
 
     cur_tab1, cur_tab2 = st.tabs(["ACP OpenAI Feed", "Google Merchant Center"])
 
+    # ==================== ACP TAB ====================
     with cur_tab1:
         acp_path = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
         if os.path.exists(acp_path):
             cur_acp = pd.read_csv(acp_path, dtype=str, keep_default_na=False)
             st.markdown(f"**{len(cur_acp)} produits, {len(cur_acp.columns)} colonnes**")
 
-            c_sub1, c_sub2, c_sub3, c_sub4 = st.tabs([
-                "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
-            ])
+            acp_mode = st.radio("Mode", ["Consulter", "Modifier"], horizontal=True, key="acp_mode")
 
-            with c_sub1:
-                cur_default = ["item_id", "title", "price", "availability", "gtin", "brand", "image_url"]
-                cur_avail = [c for c in cur_default if c in cur_acp.columns]
-                cur_sel = st.multiselect(
-                    "Colonnes a afficher", list(cur_acp.columns), default=cur_avail, key="cur_acp_cols"
+            if acp_mode == "Consulter":
+                c_sub1, c_sub2, c_sub3, c_sub4 = st.tabs([
+                    "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
+                ])
+
+                with c_sub1:
+                    cur_default = ["item_id", "title", "price", "availability", "gtin", "brand", "image_url"]
+                    cur_avail = [c for c in cur_default if c in cur_acp.columns]
+                    cur_sel = st.multiselect(
+                        "Colonnes a afficher", list(cur_acp.columns), default=cur_avail, key="cur_acp_cols"
+                    )
+                    if cur_sel:
+                        cur_search = st.text_input("Rechercher", key="cur_acp_search")
+                        d = cur_acp[cur_sel]
+                        if cur_search:
+                            d = d[d.apply(lambda r: r.astype(str).str.contains(cur_search, case=False).any(), axis=1)]
+                        st.dataframe(d, width="stretch", height=450)
+                        st.caption(f"{len(d)} lignes")
+
+                with c_sub2:
+                    fill_cur = column_fill_stats(cur_acp)
+                    filled_c = (fill_cur["Vide"] == "Non").sum()
+                    empty_c = (fill_cur["Vide"] == "Oui").sum()
+                    m1, m2 = st.columns(2)
+                    m1.metric("Colonnes remplies", f"{filled_c}/{len(cur_acp.columns)}")
+                    m2.metric("Colonnes vides", f"{empty_c}/{len(cur_acp.columns)}")
+                    st.dataframe(fill_cur, width="stretch", height=450)
+
+                with c_sub3:
+                    avail_c = availability_stats(cur_acp)
+                    if not avail_c.empty:
+                        html_bar_chart(avail_c["Statut"].tolist(), avail_c["Nombre"].tolist())
+                        st.dataframe(avail_c, width="stretch")
+
+                with c_sub4:
+                    ps = price_stats(cur_acp, "price")
+                    if ps:
+                        cols = st.columns(len(ps))
+                        for i, (k, v) in enumerate(ps.items()):
+                            cols[i].metric(k, v)
+                        prices_cur = pd.to_numeric(cur_acp["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                        html_histogram(prices_cur)
+
+            else:  # Modifier
+                st.markdown("""<div style="background:#fff8e1;border:1px solid #f9a825;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#6d4c00;">
+                Modifiez les cellules directement dans le tableau. Cliquez sur <b>Sauvegarder</b> pour enregistrer.
+                </div>""", unsafe_allow_html=True)
+
+                edit_search = st.text_input("Filtrer par SKU ou titre", key="acp_edit_search")
+                edit_cols = st.multiselect(
+                    "Colonnes a modifier",
+                    list(cur_acp.columns),
+                    default=["item_id", "title", "description", "price", "sale_price", "availability", "gtin", "image_url"],
+                    key="acp_edit_cols",
                 )
-                if cur_sel:
-                    cur_search = st.text_input("Rechercher", key="cur_acp_search")
-                    d = cur_acp[cur_sel]
-                    if cur_search:
-                        d = d[d.apply(lambda r: r.astype(str).str.contains(cur_search, case=False).any(), axis=1)]
-                    st.dataframe(d, width="stretch", height=450)
-                    st.caption(f"{len(d)} lignes")
+                if edit_cols:
+                    edit_df = cur_acp[edit_cols].copy()
+                    if edit_search:
+                        mask = edit_df.apply(lambda r: r.astype(str).str.contains(edit_search, case=False).any(), axis=1)
+                        edit_idx = edit_df[mask].index
+                        edit_df = edit_df.loc[edit_idx]
+                    else:
+                        edit_idx = edit_df.index
 
-            with c_sub2:
-                fill_cur = column_fill_stats(cur_acp)
-                filled_c = (fill_cur["Vide"] == "Non").sum()
-                empty_c = (fill_cur["Vide"] == "Oui").sum()
-                m1, m2 = st.columns(2)
-                m1.metric("Colonnes remplies", f"{filled_c}/{len(cur_acp.columns)}")
-                m2.metric("Colonnes vides", f"{empty_c}/{len(cur_acp.columns)}")
-                st.dataframe(fill_cur, width="stretch", height=450)
+                    edited = st.data_editor(
+                        edit_df,
+                        use_container_width=True,
+                        height=500,
+                        num_rows="fixed",
+                        key="acp_editor",
+                    )
 
-            with c_sub3:
-                avail_c = availability_stats(cur_acp)
-                if not avail_c.empty:
-                    html_bar_chart(avail_c["Statut"].tolist(), avail_c["Nombre"].tolist())
-                    st.dataframe(avail_c, width="stretch")
-
-            with c_sub4:
-                ps = price_stats(cur_acp, "price")
-                if ps:
-                    cols = st.columns(len(ps))
-                    for i, (k, v) in enumerate(ps.items()):
-                        cols[i].metric(k, v)
-                    prices_cur = pd.to_numeric(cur_acp["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
-                    html_histogram(prices_cur)
+                    b1, b2 = st.columns([1, 4])
+                    with b1:
+                        if st.button("Sauvegarder ACP", type="primary", key="save_acp"):
+                            for col in edit_cols:
+                                cur_acp.loc[edit_idx, col] = edited[col].values
+                            cur_acp.to_csv(acp_path, index=False, encoding="utf-8")
+                            st.success(f"ACP sauvegarde ({len(cur_acp)} produits)")
+                            st.rerun()
+                    with b2:
+                        st.caption(f"{len(edit_df)} lignes affichees / {len(cur_acp)} total")
         else:
             st.info("Aucun fichier ACP trouve")
 
+    # ==================== GMC TAB ====================
     with cur_tab2:
         gmc_path = find_gmc_file()
         if gmc_path:
             cur_gmc = pd.read_excel(gmc_path, dtype=str, keep_default_na=False)
             st.markdown(f"**{len(cur_gmc)} produits, {len(cur_gmc.columns)} colonnes**")
 
-            g_sub1, g_sub2, g_sub3, g_sub4 = st.tabs([
-                "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
-            ])
+            gmc_mode = st.radio("Mode", ["Consulter", "Modifier"], horizontal=True, key="gmc_mode")
 
-            with g_sub1:
-                gmc_def = ["id", "title", "price", "availability", "gtin", "brand", "image link"]
-                gmc_av = [c for c in gmc_def if c in cur_gmc.columns]
-                gmc_sel = st.multiselect(
-                    "Colonnes a afficher", list(cur_gmc.columns), default=gmc_av, key="cur_gmc_cols"
+            if gmc_mode == "Consulter":
+                g_sub1, g_sub2, g_sub3, g_sub4 = st.tabs([
+                    "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
+                ])
+
+                with g_sub1:
+                    gmc_def = ["id", "title", "price", "availability", "gtin", "brand", "image link"]
+                    gmc_av = [c for c in gmc_def if c in cur_gmc.columns]
+                    gmc_sel = st.multiselect(
+                        "Colonnes a afficher", list(cur_gmc.columns), default=gmc_av, key="cur_gmc_cols"
+                    )
+                    if gmc_sel:
+                        g_search = st.text_input("Rechercher", key="cur_gmc_search")
+                        dg = cur_gmc[gmc_sel]
+                        if g_search:
+                            dg = dg[dg.apply(lambda r: r.astype(str).str.contains(g_search, case=False).any(), axis=1)]
+                        st.dataframe(dg, width="stretch", height=450)
+                        st.caption(f"{len(dg)} lignes")
+
+                with g_sub2:
+                    gmc_fill = column_fill_stats(cur_gmc)
+                    filled_g = (gmc_fill["Vide"] == "Non").sum()
+                    empty_g = (gmc_fill["Vide"] == "Oui").sum()
+                    m1, m2 = st.columns(2)
+                    m1.metric("Colonnes remplies", f"{filled_g}/{len(cur_gmc.columns)}")
+                    m2.metric("Colonnes vides", f"{empty_g}/{len(cur_gmc.columns)}")
+                    st.dataframe(gmc_fill, width="stretch", height=450)
+
+                with g_sub3:
+                    gavail_c = availability_stats(cur_gmc)
+                    if not gavail_c.empty:
+                        html_bar_chart(gavail_c["Statut"].tolist(), gavail_c["Nombre"].tolist())
+                        st.dataframe(gavail_c, width="stretch")
+
+                with g_sub4:
+                    gps = price_stats(cur_gmc, "price")
+                    if gps:
+                        cols = st.columns(len(gps))
+                        for i, (k, v) in enumerate(gps.items()):
+                            cols[i].metric(k, v)
+                        prices_gmc_cur = pd.to_numeric(cur_gmc["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                        html_histogram(prices_gmc_cur)
+
+            else:  # Modifier
+                st.markdown("""<div style="background:#fff8e1;border:1px solid #f9a825;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#6d4c00;">
+                Modifiez les cellules directement dans le tableau. Cliquez sur <b>Sauvegarder</b> pour enregistrer.
+                </div>""", unsafe_allow_html=True)
+
+                gedit_search = st.text_input("Filtrer par SKU ou titre", key="gmc_edit_search")
+                gedit_cols = st.multiselect(
+                    "Colonnes a modifier",
+                    list(cur_gmc.columns),
+                    default=["id", "title", "description", "price", "sale price", "availability", "gtin", "image link"],
+                    key="gmc_edit_cols",
                 )
-                if gmc_sel:
-                    g_search = st.text_input("Rechercher", key="cur_gmc_search")
-                    dg = cur_gmc[gmc_sel]
-                    if g_search:
-                        dg = dg[dg.apply(lambda r: r.astype(str).str.contains(g_search, case=False).any(), axis=1)]
-                    st.dataframe(dg, width="stretch", height=450)
-                    st.caption(f"{len(dg)} lignes")
+                if gedit_cols:
+                    gedit_df = cur_gmc[gedit_cols].copy()
+                    if gedit_search:
+                        gmask = gedit_df.apply(lambda r: r.astype(str).str.contains(gedit_search, case=False).any(), axis=1)
+                        gedit_idx = gedit_df[gmask].index
+                        gedit_df = gedit_df.loc[gedit_idx]
+                    else:
+                        gedit_idx = gedit_df.index
 
-            with g_sub2:
-                gmc_fill = column_fill_stats(cur_gmc)
-                filled_g = (gmc_fill["Vide"] == "Non").sum()
-                empty_g = (gmc_fill["Vide"] == "Oui").sum()
-                m1, m2 = st.columns(2)
-                m1.metric("Colonnes remplies", f"{filled_g}/{len(cur_gmc.columns)}")
-                m2.metric("Colonnes vides", f"{empty_g}/{len(cur_gmc.columns)}")
-                st.dataframe(gmc_fill, width="stretch", height=450)
+                    gedited = st.data_editor(
+                        gedit_df,
+                        use_container_width=True,
+                        height=500,
+                        num_rows="fixed",
+                        key="gmc_editor",
+                    )
 
-            with g_sub3:
-                gavail_c = availability_stats(cur_gmc)
-                if not gavail_c.empty:
-                    html_bar_chart(gavail_c["Statut"].tolist(), gavail_c["Nombre"].tolist())
-                    st.dataframe(gavail_c, width="stretch")
-
-            with g_sub4:
-                gps = price_stats(cur_gmc, "price")
-                if gps:
-                    cols = st.columns(len(gps))
-                    for i, (k, v) in enumerate(gps.items()):
-                        cols[i].metric(k, v)
-                    prices_gmc_cur = pd.to_numeric(cur_gmc["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
-                    html_histogram(prices_gmc_cur)
+                    gb1, gb2 = st.columns([1, 4])
+                    with gb1:
+                        if st.button("Sauvegarder GMC", type="primary", key="save_gmc"):
+                            for col in gedit_cols:
+                                cur_gmc.loc[gedit_idx, col] = gedited[col].values
+                            with pd.ExcelWriter(gmc_path, engine="openpyxl") as writer:
+                                cur_gmc.to_excel(writer, sheet_name="Products", index=False)
+                            st.success(f"GMC sauvegarde ({len(cur_gmc)} produits)")
+                            st.rerun()
+                    with gb2:
+                        st.caption(f"{len(gedit_df)} lignes affichees / {len(cur_gmc)} total")
         else:
             st.info("Aucun fichier GMC trouve")
 
