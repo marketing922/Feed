@@ -23,14 +23,17 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Data files (large/sensitive - keep locally, not in repo)
-*.csv
-*.xlsx
+# Exports ERP (generated, user-uploaded)
+export-variants-*.xlsx
+
+# PDF reports
 *.pdf
-*.png
 
-# Exceptions: keep config and reference files
-!requirements.txt
+# Screenshots
+screen.png
 
-# Streamlit cache
+# Streamlit secrets (credentials)
 .streamlit/secrets.toml
+
+# Claude
+.claude/
