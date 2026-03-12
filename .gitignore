@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Data files (large/sensitive - keep locally, not in repo)
+*.csv
+*.xlsx
+*.pdf
+*.png
+
+# Exceptions: keep config and reference files
+!requirements.txt
+
+# Streamlit cache
+.streamlit/secrets.toml
