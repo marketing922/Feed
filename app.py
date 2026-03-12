@@ -921,10 +921,12 @@ if page == "Importer le fichier Export ERP":
 
             # --- Stats ---
             st.markdown('<h2 class="section-title">Resultats</h2>', unsafe_allow_html=True)
-            col1, col2 = st.columns(2)
+            col1, col2 = st.columns(2, gap="large")
 
             with col1:
-                st.markdown("**Feed ACP OpenAI**")
+                st.markdown("""<div style="background:#fff;border:1px solid #E5E5E5;border-left:4px solid #89B832;border-radius:8px;padding:18px 16px 10px;">
+                <h3 style="margin:0 0 12px;font-size:16px;color:#89B832;font-family:Georgia,serif;">Feed ACP OpenAI</h3>
+                </div>""", unsafe_allow_html=True)
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Total produits", acp_stats.get("total", 0))
                 c2.metric("Nouveaux", f"+{acp_stats.get('nouveaux', 0)}")
@@ -938,7 +940,9 @@ if page == "Importer le fichier Export ERP":
                 c8.metric("URLs", f"~{acp_stats.get('urls', 0)}")
 
             with col2:
-                st.markdown("**Feed Google Merchant Center**")
+                st.markdown("""<div style="background:#fff;border:1px solid #E5E5E5;border-left:4px solid #1A1A1A;border-radius:8px;padding:18px 16px 10px;">
+                <h3 style="margin:0 0 12px;font-size:16px;color:#1A1A1A;font-family:Georgia,serif;">Feed Google Merchant Center</h3>
+                </div>""", unsafe_allow_html=True)
                 if gmc_df is not None:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Total produits", gmc_stats.get("total", 0))
