@@ -58,9 +58,18 @@ def extract_rich_desc(html):
 
 
 def fix_price(val):
+    """Normalise un prix au format  '8,15 EUR'."""
     if not val or val.strip() == "":
         return ""
-    return re.sub(r"(\d+),(\d+)", r"\1.\2", val)
+    v = val.strip()
+    # Retirer un eventuel suffixe devise existant (EUR, €, etc.)
+    v = re.sub(r"\s*(EUR|€)\s*$", "", v, flags=re.IGNORECASE).strip()
+    # Normaliser le separateur decimal : point -> virgule
+    v = v.replace(".", ",")
+    # S'assurer qu'on a bien un format numerique
+    if re.match(r"^\d+,\d+$", v) or re.match(r"^\d+$", v):
+        return v + " EUR"
+    return v + " EUR"
 
 
 def get_custom_variant_format(title):
@@ -211,7 +220,7 @@ def generate_acp(xlsx_bytes, log):
         new_rows["brand"] = "Laboratoire Calebasse"
         new_rows["condition"] = "new"
         new_rows["title"] = new_rows["title"].apply(lambda t: " ".join(t.split()))
-        avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "preorder"}
+        avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
         new_rows["availability"] = new_rows["availability"].map(avail_map).fillna("out_of_stock")
         df = pd.concat([df, new_rows[df.columns]], ignore_index=True)
     stats["nouveaux"] = len(new_ids)
@@ -229,7 +238,7 @@ def generate_acp(xlsx_bytes, log):
     common_mask = df["id"].isin(dx_idx.index)
     common_ids = df.loc[common_mask, "id"]
 
-    avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "preorder"}
+    avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
     new_avail = common_ids.map(lambda i: avail_map.get(dx_idx.loc[i, "availability"], "out_of_stock"))
     changed_avail = int((df.loc[common_mask, "availability"] != new_avail).sum())
     df.loc[common_mask, "availability"] = new_avail.values
@@ -338,6 +347,9 @@ def generate_acp(xlsx_bytes, log):
     df["seller_tos"] = "https://calebasse.com/cgv"
     df["target_countries"] = "FR,AL,DE,AD,AT,BE,BY,BA,BG,CY,HR,DK,ES,ES,IC,EA,IC,EA,EE,FI,CP,GF,MQ,YT,NC,PF,RE,BL,SM,PM,TF,WF,GR,HK,HU,IE,IS,IT,KZ,XK,LV,LT,LU,MK,MT,MD,MC,ME,NO,NL,PL,PT,CZ,RO,GB,SK,SE,CH,VA"
     df["store_country"] = "FR"
+
+    # MPN : sku-{item_id}
+    df["mpn"] = df["item_id"].apply(lambda x: "sku-" + x.strip() if x.strip() else "")
 
     group_counts = df[df["group_id"] != ""].groupby("group_id")["item_id"].count()
     multi = set(group_counts[group_counts > 1].index)
@@ -507,7 +519,7 @@ def generate_gmc(xlsx_bytes, log):
         new_rows["title"] = new_rows["title"].apply(lambda t: " ".join(t.split()))
         new_rows["identifier exists"] = "no"
         new_rows["adult"] = "no"
-        avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "preorder"}
+        avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
         new_rows["availability"] = new_rows["availability"].map(avail_map).fillna("out_of_stock")
         gmc = pd.concat([gmc, new_rows[gmc.columns]], ignore_index=True)
     stats["nouveaux"] = len(new_ids)
@@ -525,7 +537,7 @@ def generate_gmc(xlsx_bytes, log):
     common_mask = gmc["id"].isin(dx_idx.index)
     common_ids = gmc.loc[common_mask, "id"]
 
-    avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "preorder"}
+    avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
     new_avail = common_ids.map(lambda i: avail_map.get(dx_idx.loc[i, "availability"], "out_of_stock"))
     changed_avail = int((gmc.loc[common_mask, "availability"] != new_avail).sum())
     gmc.loc[common_mask, "availability"] = new_avail.values
@@ -591,9 +603,19 @@ def generate_gmc(xlsx_bytes, log):
                 if sku in barcodes and not gmc.at[idx, "gtin"]:
                     gmc.at[idx, "gtin"] = barcodes[sku]
 
+    # MPN : sku-{id}
+    if "mpn" in gmc.columns:
+        gmc["mpn"] = gmc["id"].apply(lambda x: "sku-" + x.strip() if x.strip() else "")
+
     # identifier exists en fonction du gtin
     if "gtin" in gmc.columns and "identifier exists" in gmc.columns:
         gmc["identifier exists"] = gmc["gtin"].apply(lambda g: "yes" if g and g.strip() else "no")
+
+    # Prix : format "X,XX EUR"
+    if "price" in gmc.columns:
+        gmc["price"] = gmc["price"].apply(fix_price)
+    if "sale price" in gmc.columns:
+        gmc["sale price"] = gmc["sale price"].apply(fix_price)
 
     stats["total"] = len(gmc)
     log.append(f"GMC: = {len(gmc)} produits, {len(gmc.columns)} colonnes")
@@ -660,7 +682,8 @@ def price_stats(df, col="price"):
     """Basic price distribution."""
     if col not in df.columns:
         return {}
-    prices = pd.to_numeric(df[col].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+    raw = df[col].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True)
+    prices = pd.to_numeric(raw, errors="coerce").dropna()
     if prices.empty:
         return {}
     return {
@@ -1073,7 +1096,7 @@ if page == "Importer le fichier Export ERP":
                         cols = st.columns(len(pstats))
                         for i, (k, v) in enumerate(pstats.items()):
                             cols[i].metric(k, v)
-                        prices = pd.to_numeric(acp_df["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                        prices = pd.to_numeric(acp_df["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
                         html_histogram(prices)
 
             # --- GMC Preview Tab ---
@@ -1124,7 +1147,7 @@ if page == "Importer le fichier Export ERP":
                             cols = st.columns(len(gpstats))
                             for i, (k, v) in enumerate(gpstats.items()):
                                 cols[i].metric(k, v)
-                            prices_g = pd.to_numeric(gmc_df["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                            prices_g = pd.to_numeric(gmc_df["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
                             html_histogram(prices_g)
                 else:
                     st.warning("Fichier GMC non genere")
@@ -1275,7 +1298,7 @@ elif page == "Apercu des fichiers actuels":
                         cols = st.columns(len(ps))
                         for i, (k, v) in enumerate(ps.items()):
                             cols[i].metric(k, v)
-                        prices_cur = pd.to_numeric(cur_acp["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                        prices_cur = pd.to_numeric(cur_acp["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
                         html_histogram(prices_cur)
 
             else:  # Modifier
@@ -1369,7 +1392,7 @@ elif page == "Apercu des fichiers actuels":
                         cols = st.columns(len(gps))
                         for i, (k, v) in enumerate(gps.items()):
                             cols[i].metric(k, v)
-                        prices_gmc_cur = pd.to_numeric(cur_gmc["price"].str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                        prices_gmc_cur = pd.to_numeric(cur_gmc["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
                         html_histogram(prices_gmc_cur)
 
             else:  # Modifier
