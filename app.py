@@ -198,9 +198,9 @@ def generate_acp(xlsx_bytes, log):
     dx_idx = dx.set_index("id")
     stats = {}
 
-        link_cols = ["image link", "additional image link", "link"]
-        dx = replace_semicolon_with_comma(dx, link_cols)
-        gmc = replace_semicolon_with_comma(gmc, link_cols)
+    link_cols = ["image link", "additional image link", "link"]
+    dx = replace_semicolon_with_comma(dx, link_cols)
+    gmc = replace_semicolon_with_comma(gmc, link_cols)
     # a) Nouveaux produits
     new_ids = set(dx["id"]) - set(df["id"])
     if new_ids:
