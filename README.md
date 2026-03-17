@@ -22,30 +22,81 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-L'application demarre sur `http://localhost:8501`.
+L’application démarre sur `http://localhost:8501`.
 
-### Fichiers requis dans le repertoire
+### Organisation des dossiers et fichiers
 
-| Fichier | Description |
-|---------|-------------|
-| `Flux Google Merchant Center – Products source.xlsx` | Feed GMC existant (base de donnees produits) |
-| `Etiquette-AB - final.csv` | Codes-barres groupe A-B |
-| `Etiquette-CD - final.csv` | Codes-barres groupe C-D |
-| `related_products.json` | Groupes de produits associes |
+```
+ACP/
+│
+├── app.py
+├── requirements.txt
+├── README.md
+├── .streamlit/           # Config Streamlit (optionnel)
+│
+├── Files/                # Données sources (import/export)
+│   ├── Intégration ACP - Feuille 1.csv
+│   ├── Etiquette-AB - final.csv
+│   ├── Etiquette-CD - final.csv
+│   ├── export-variants-2026-03-12.xlsx
+│   └── ...
+│
+├── Files to update/      # Fichiers générés/exportés automatiquement
+│   ├── ACP_OpenAI_Feed.csv
+│   └── Flux Google Merchant Center – Products source.xlsx
+│
+├── Scripts/              # Scripts utilitaires
+│   ├── convert_to_acp.py
+│   ├── generate_pdf.py
+│   ├── gen_pdf.py
+│   └── related_products.json
+│
+├── Design/               # Documentation, maquettes, visuels
+│   ├── code.html
+│   └── screen.png
+└── ...
+```
+
+#### Fichiers requis (à placer dans les bons dossiers)
+
+| Dossier / Fichier | Description |
+|-------------------|-------------|
+| `Files/Intégration ACP - Feuille 1.csv` | Export Google Shopping (source initiale) |
+| `Files/export-variants-2026-03-12.xlsx` | Export ERP (fichier à importer) |
+| `Files/Etiquette-AB - final.csv` | Codes-barres groupe A-B |
+| `Files/Etiquette-CD - final.csv` | Codes-barres groupe C-D |
+| `Scripts/related_products.json` | Groupes de produits associés |
+
+#### Fichiers générés automatiquement
+
+| Dossier / Fichier | Description |
+|-------------------|-------------|
+| `Files to update/ACP_OpenAI_Feed.csv` | Feed ACP OpenAI (77 colonnes) |
+| `Files to update/Flux Google Merchant Center – Products source (1).xlsx` | Feed Google Merchant Center |
 
 ### Navigation
 
-L'interface propose deux pages via la sidebar :
+L’interface propose deux pages via la sidebar :
 
-1. **Importer le fichier Export ERP** : Upload, generation, resultats, apercu des donnees generees, telechargement et sauvegarde locale
-2. **Apercu des fichiers actuels** : Consultation des fichiers ACP et GMC existants avec statistiques
+1. **Importer le fichier Export ERP** : Import du fichier ERP, génération automatique des feeds, aperçu, téléchargement et sauvegarde locale dans `Files to update/`
+2. **Aperçu des fichiers actuels** : Consultation des feeds ACP et GMC existants, statistiques, téléchargement
+
+## Installation & Prérequis
+
+1. **Python 3.12+** installé (recommandé : venv ou conda)
+2. Installer les dépendances :
+	```bash
+	pip install -r requirements.txt
+	```
+3. Placer tous les fichiers requis dans les bons dossiers (voir plus haut)
+4. (Optionnel) Configurer le dossier `.streamlit/` pour personnaliser l’UI
 
 ## Stack technique
 
 - **Python 3.12+**
 - **Streamlit 1.50+** — Interface web
-- **Pandas** — Traitement des donnees
-- **openpyxl** — Lecture/ecriture Excel
+- **Pandas** — Traitement des données
+- **openpyxl** — Lecture/écriture Excel
 
 ## Design System
 

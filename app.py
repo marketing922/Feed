@@ -15,11 +15,14 @@ from datetime import datetime
 
 # --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ACP_FEED = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
-ETIQUETTE_AB = os.path.join(BASE_DIR, "Etiquette-AB - final.csv")
-ETIQUETTE_CD = os.path.join(BASE_DIR, "Etiquette-CD - final.csv")
-RELATED_JSON = os.path.join(BASE_DIR, "related_products.json")
-GMC_PATTERN = os.path.join(BASE_DIR, "Flux Google*")
+FILES_DIR = os.path.join(BASE_DIR, "Files")
+FILES_UPDATE_DIR = os.path.join(BASE_DIR, "Files to update")
+SCRIPTS_DIR = os.path.join(BASE_DIR, "Scripts")
+ACP_FEED = os.path.join(FILES_UPDATE_DIR, "ACP_OpenAI_Feed.csv")
+ETIQUETTE_AB = os.path.join(FILES_DIR, "Etiquette-AB - final.csv")
+ETIQUETTE_CD = os.path.join(FILES_DIR, "Etiquette-CD - final.csv")
+RELATED_JSON = os.path.join(SCRIPTS_DIR, "related_products.json")
+GMC_PATTERN = os.path.join(FILES_UPDATE_DIR, "Flux Google*")
 
 def find_gmc_file():
     """Trouver le fichier GMC malgre les caracteres speciaux."""
@@ -195,6 +198,9 @@ def generate_acp(xlsx_bytes, log):
     dx_idx = dx.set_index("id")
     stats = {}
 
+        link_cols = ["image link", "additional image link", "link"]
+        dx = replace_semicolon_with_comma(dx, link_cols)
+        gmc = replace_semicolon_with_comma(gmc, link_cols)
     # a) Nouveaux produits
     new_ids = set(dx["id"]) - set(df["id"])
     if new_ids:
@@ -469,6 +475,15 @@ def generate_acp(xlsx_bytes, log):
     stats["total"] = len(df)
     log.append(f"= {len(df)} produits, {len(df.columns)} colonnes")
     return df, stats, removed_df
+    def replace_semicolon_with_comma(df, columns):
+        """Remplace les points-virgules par des virgules dans les colonnes de liens."""
+        for col in columns:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: x.replace(';', ',') if isinstance(x, str) else x)
+        return df
+        # Correction des points-virgules dans les colonnes de liens
+        link_cols = ["image_url", "additional_image_urls", "url"]
+        df = replace_semicolon_with_comma(df, link_cols)
 
 
 def generate_gmc(xlsx_bytes, log):

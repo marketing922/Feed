@@ -5,9 +5,9 @@ import os
 
 # --- 0. Charger les deux sources et fusionner ---
 # CSV = source initiale (Google Shopping), XLSX = export frais (prioritaire)
-df = pd.read_csv("Intégration ACP - Feuille 1.csv", dtype=str, keep_default_na=False)
+df = pd.read_csv("../Files/Intégration ACP - Feuille 1.csv", dtype=str, keep_default_na=False)
 
-xlsx_file = "export-variants-2026-03-12.xlsx"
+xlsx_file = "../Files/export-variants-2026-03-12.xlsx"
 if os.path.exists(xlsx_file):
     dx = pd.read_excel(xlsx_file, dtype=str, keep_default_na=False)
     dx["id"] = dx["id"].str.strip()
@@ -392,7 +392,7 @@ df["reviews"] = ""
 
 # Related products - charger depuis le fichier JSON si disponible
 import os
-related_file = "related_products.json"
+related_file = "../Scripts/related_products.json"
 if os.path.exists(related_file):
     with open(related_file, "r", encoding="utf-8") as f:
         related_map = json.load(f)
@@ -528,7 +528,7 @@ for col in all_columns_ordered:
 df = df[all_columns_ordered]
 
 # --- 11. Exporter ---
-output_file = "ACP_OpenAI_Feed.csv"
+output_file = "../Files to update/ACP_OpenAI_Feed.csv"
 df.to_csv(output_file, index=False, encoding="utf-8")
 
 print(f"Fichier ACP genere : {output_file}")
