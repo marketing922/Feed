@@ -1,38 +1,182 @@
-"""
-Outil de mise a jour automatique des feeds ACP et GMC
-Laboratoire Calebasse
-"""
+# ============================================================
+# IMPORTS — doivent être en premier
+# ============================================================
+import re
+import math
+import io
+import os
+import glob
+import hashlib
+import json
+from datetime import datetime
 
 import streamlit as st
 import pandas as pd
-import re
-import json
-import os
-import glob
-import io
-import hashlib
-from datetime import datetime
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
 
-# --- Configuration ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILES_DIR = os.path.join(BASE_DIR, "Files")
+# ============================================================
+# CONFIGURATION
+# ============================================================
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+FILES_DIR       = os.path.join(BASE_DIR, "Files")
 FILES_UPDATE_DIR = os.path.join(BASE_DIR, "Files to update")
-SCRIPTS_DIR = os.path.join(BASE_DIR, "Scripts")
-ACP_FEED = os.path.join(FILES_UPDATE_DIR, "ACP_OpenAI_Feed.csv")
-ETIQUETTE_AB = os.path.join(FILES_DIR, "Etiquette-AB - final.csv")
-ETIQUETTE_CD = os.path.join(FILES_DIR, "Etiquette-CD - final.csv")
-RELATED_JSON = os.path.join(SCRIPTS_DIR, "related_products.json")
-GMC_PATTERN = os.path.join(FILES_UPDATE_DIR, "Flux Google*")
+SCRIPTS_DIR     = os.path.join(BASE_DIR, "Scripts")
+ACP_FEED        = os.path.join(FILES_UPDATE_DIR, "ACP_OpenAI_Feed.csv")
+ETIQUETTE_AB    = os.path.join(FILES_DIR, "Etiquette-AB - final.csv")
+ETIQUETTE_CD    = os.path.join(FILES_DIR, "Etiquette-CD - final.csv")
+RELATED_JSON    = os.path.join(SCRIPTS_DIR, "related_products.json")
+GMC_PATTERN     = os.path.join(FILES_UPDATE_DIR, "Flux Google*")
+
 
 def find_gmc_file():
-    """Trouver le fichier GMC malgre les caracteres speciaux."""
     files = glob.glob(GMC_PATTERN)
     return files[0] if files else None
 
-# --- Helpers ---
+
+# ============================================================
+# CHAMP MAP GMC — seules ces colonnes sont écrasées par l'ERP
+# (mapping : colonne GMC → colonne ERP)
+# ============================================================
+GMC_FIELD_MAP = {
+    # clé = colonne GMC (avec espaces)   valeur = colonne ERP (avec underscores)
+    "title"                 : "title",
+    "link"                  : "url",
+    "image link"            : "image_link",
+    "additional image link" : "additional_image_link",
+    "item group id"         : "item_group_id",
+    # description, availability, price, sale price → traitement spécial ci-dessous
+}
+GMC_SPECIAL = {"description", "availability", "price", "sale price"}
+GMC_MANAGED = set(GMC_FIELD_MAP.keys()) | GMC_SPECIAL   # périmètre complet
+
+
+# ============================================================
+# HELPERS — fonctions utilitaires
+# ============================================================
+
+def is_empty(val):
+    if val is None:
+        return True
+    if isinstance(val, float) and math.isnan(val):
+        return True
+    return str(val).strip() in ("", "nan", "None")
+
+
+def clean_html(raw):
+    if is_empty(raw):
+        return ""
+    text = re.sub(r"<[^>]+>", " ", str(raw))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_bullets(html):
+    if is_empty(html) or str(html).strip() == "<ul></ul>":
+        return []
+    items = re.findall(r"<li[^>]*>(.*?)</li>", str(html), re.IGNORECASE | re.DOTALL)
+    return [clean_html(item) for item in items if clean_html(item)]
+
+
+def build_description(description, rich_text):
+    """
+    Construit la description :
+      <description ERP> Ses principaux bienfaits : <bienfait1>, <bienfait2>, ...
+    - base = champ 'description' de l'ERP (texte court)
+    - le point final de base est géré pour éviter la double ponctuation
+    - bienfaits = <li> de rich_text_description, en minuscules, sans HTML
+    """
+    base = str(description).strip() if not is_empty(description) else ""
+    base_clean = base.rstrip(".")           # BUG 3 corrigé
+    bullets = extract_bullets(rich_text)
+    if bullets:
+        bienfaits = ", ".join(b.lower() for b in bullets)
+        if base_clean:
+            return f"{base_clean}. Ses principaux bienfaits : {bienfaits}"
+        return f"Ses principaux bienfaits : {bienfaits}"
+    return base
+
+
+def normalize_availability(val):
+    """AVAILABLE/in_stock → in_stock | OUT_OF_STOCK/AVAILABLE_SOON → out_of_stock"""
+    if is_empty(val):
+        return "out_of_stock"
+    v = str(val).strip().lower()
+    return "in_stock" if v in ("available", "in_stock") else "out_of_stock"
+
+
+def format_price(val):
+    """Retourne '12,90 EUR' (virgule décimale). BUG 2 corrigé."""
+    if is_empty(val):
+        return ""
+    try:
+        num = float(str(val).replace("EUR", "").replace(",", ".").strip())
+        return f"{num:.2f}".replace(".", ",") + " EUR"
+    except (ValueError, TypeError):
+        return ""
+
+
+def convert_links(val):
+    """Liens séparés par ';' (ERP) → séparés par ', ' (GMC/ACP)."""
+    if is_empty(val):
+        return ""
+    parts = [p.strip() for p in str(val).replace(";", ",").split(",") if p.strip()]
+    return ", ".join(parts)
+
+
+def extract_hyperlink_label(cell_value):
+    """Extrait le label d'une formule =HYPERLINK('url','label')."""
+    if cell_value and str(cell_value).startswith("=HYPERLINK"):
+        m = re.search(r',\s*"([^"]+)"\s*\)', str(cell_value))
+        if m:
+            return m.group(1)
+    return cell_value
+
+
+def cell_val(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and math.isnan(v):
+        return ""
+    return v
+
+
+# ============================================================
+# LECTURE DU GMC VIA OPENPYXL (préserve les HYPERLINK headers)
+# BUG 6,7,8 corrigés
+# ============================================================
+
+def read_gmc_openpyxl(path, sheet_name="Feuille 1"):
+    """Lit le fichier GMC et retourne (headers_labels, list_of_dicts)."""
+    wb = load_workbook(path, data_only=False)
+    # Chercher la feuille principale (Feuille 1 ou première feuille hors Produits_retirés)
+    sheet = None
+    for sn in wb.sheetnames:
+        if sn not in ("Produits_retirés", "exad"):
+            sheet = wb[sn]
+            break
+    if sheet is None:
+        return [], []
+
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        return [], []
+
+    raw_headers = rows[0]
+    headers = [extract_hyperlink_label(h) or f"col_{i}" for i, h in enumerate(raw_headers)]
+
+    data = []
+    for row in rows[1:]:
+        record = {h: cell_val(v) for h, v in zip(headers, row)}
+        data.append(record)
+
+    return headers, data
+
+
+# ============================================================
+# EXTRACTION CODES-BARRES
+# ============================================================
 
 def extract_barcodes():
-    """Extraire les codes-barres des fichiers Etiquette."""
     barcodes = {}
     for path in [ETIQUETTE_AB, ETIQUETTE_CD]:
         if not os.path.exists(path):
@@ -48,28 +192,17 @@ def extract_barcodes():
     return barcodes
 
 
-def extract_rich_desc(html):
-    if not html or html == "<ul></ul>":
-        return ""
-    items = re.findall(r"<li>(.*?)</li>", html, re.DOTALL)
-    if items:
-        cleaned = [re.sub(r"<[^>]+>", "", item).strip() for item in items if re.sub(r"<[^>]+>", "", item).strip()]
-        return ", ".join(cleaned).lower()
-    # Fallback: strip all HTML tags
-    text = re.sub(r"<[^>]+>", "", html).strip()
-    return text.lower()
-
+# ============================================================
+# HELPERS ACP
+# ============================================================
 
 def fix_price(val):
-    """Normalise un prix au format  '8,15 EUR'."""
-    if not val or val.strip() == "":
+    """Normalise un prix au format '8,15 EUR'."""
+    if not val or str(val).strip() == "":
         return ""
-    v = val.strip()
-    # Retirer un eventuel suffixe devise existant (EUR, €, etc.)
+    v = str(val).strip()
     v = re.sub(r"\s*(EUR|€)\s*$", "", v, flags=re.IGNORECASE).strip()
-    # Normaliser le separateur decimal : point -> virgule
     v = v.replace(".", ",")
-    # S'assurer qu'on a bien un format numerique
     if re.match(r"^\d+,\d+$", v) or re.match(r"^\d+$", v):
         return v + " EUR"
     return v + " EUR"
@@ -77,18 +210,12 @@ def fix_price(val):
 
 def get_custom_variant_format(title):
     t = title.lower()
-    if "poudre concentr" in t:
-        return "Poudre concentree"
-    if "gelules" in t or "gélules" in t:
-        return "Gelules"
-    if "grand sachet" in t:
-        return "Grand Sachet"
-    if "petit sachet" in t:
-        return "Petit Sachet"
-    if "sachets" in t or "sachet" in t:
-        return "Sachet"
-    if "flacon" in t:
-        return "Flacon"
+    if "poudre concentr" in t: return "Poudre concentree"
+    if "gelules" in t or "gélules" in t: return "Gelules"
+    if "grand sachet" in t: return "Grand Sachet"
+    if "petit sachet" in t: return "Petit Sachet"
+    if "sachets" in t or "sachet" in t: return "Sachet"
+    if "flacon" in t: return "Flacon"
     return ""
 
 
@@ -100,19 +227,13 @@ def get_weight_from_title(title):
 def build_variant_dict(title):
     variant = {}
     t = title.lower()
-    if "poudre concentr" in t:
-        variant["format"] = "Poudre concentree"
-    elif "gelules" in t or "gélules" in t:
-        variant["format"] = "Gelules"
-    elif "grand sachet" in t:
-        variant["format"] = "Grand Sachet"
-    elif "petit sachet" in t:
-        variant["format"] = "Petit Sachet"
-    elif "sachets" in t or "sachet" in t:
-        variant["format"] = "Sachet"
+    if "poudre concentr" in t: variant["format"] = "Poudre concentree"
+    elif "gelules" in t or "gélules" in t: variant["format"] = "Gelules"
+    elif "grand sachet" in t: variant["format"] = "Grand Sachet"
+    elif "petit sachet" in t: variant["format"] = "Petit Sachet"
+    elif "sachets" in t or "sachet" in t: variant["format"] = "Sachet"
     w = re.search(r"(\d+\s*[gG](?:r)?)\b", title)
-    if w:
-        variant["poids"] = w.group(1).strip()
+    if w: variant["poids"] = w.group(1).strip()
     return json.dumps(variant, ensure_ascii=False) if variant else ""
 
 
@@ -123,7 +244,10 @@ def build_group_title(title):
     return title
 
 
-# Q&A generique
+# ============================================================
+# Q&A & WARNING
+# ============================================================
+
 QA_LIST = [
     {"q": "Comment preparer et utiliser les plantes ?",
      "a": "Plantes entieres : decoction 20 min, boire apres les repas. Gelules : 6 par jour. Poudre concentree : diluer dans de l'eau chaude. Poudre moulue : faire bouillir 10 min."},
@@ -182,469 +306,299 @@ ACP_COLUMNS = [
     "target_countries", "store_country", "geo_price", "geo_availability",
 ]
 
+# Mapping ERP → ACP
+# Seules ces colonnes sont écrasées — les 68 autres colonnes ACP sont préservées
+ACP_FIELD_MAP = {
+    # clé = colonne ACP        valeur = colonne ERP
+    "item_id"               : "id",            # clé de jointure (ne pas écraser, sert d'index)
+    "title"                 : "title",
+    "url"                   : "url",
+    "image_url"             : "image_link",
+    "additional_image_urls" : "additional_image_link",
+    "group_id"              : "item_group_id",
+    # description, availability, price, sale_price → traitement spécial ci-dessous
+}
+ACP_SPECIAL  = {"description", "availability", "price", "sale_price"}
+ACP_MANAGED  = set(ACP_FIELD_MAP.keys()) | ACP_SPECIAL
+
+
+
+# ============================================================
+# HELPERS ACP — miroir des helpers GMC
+# ============================================================
+
+def update_acp_record(record, src):
+    """
+    Met à jour un enregistrement ACP depuis l'ERP.
+    Respecte strictement ACP_MANAGED — les 68 autres colonnes ne sont PAS touchées.
+    """
+    updated = record.copy()
+
+    # Champs directs (sauf item_id qui est la clé, ne pas écraser)
+    for acp_col, erp_col in ACP_FIELD_MAP.items():
+        if acp_col == "item_id":
+            continue
+        val = src.get(erp_col, None)
+        if acp_col == "additional_image_urls":
+            updated[acp_col] = convert_links(val)
+        else:
+            updated[acp_col] = "" if is_empty(val) else str(val).strip()
+
+    # Champs spéciaux
+    updated["description"]  = build_description(
+        src.get("description", ""), src.get("rich_text_description", "")
+    )
+    updated["availability"] = normalize_availability(src.get("availability", ""))
+    updated["price"]        = format_price(src.get("price", ""))
+    sale_raw = src.get("sale_price", "")
+    updated["sale_price"]   = format_price(sale_raw) if not is_empty(sale_raw) else ""
+
+    return updated
+
+
+def load_acp_as_df(path):
+    """Lit le fichier ACP CSV et retourne un DataFrame (colonnes propres)."""
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+def save_acp_from_df(df, path):
+    """Sauvegarde le DataFrame ACP en CSV (préserve toutes les colonnes)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8")
+
+
+# ============================================================
+# GÉNÉRATION ACP
+# ============================================================
 
 def generate_acp(xlsx_bytes, log):
-    """Generer le feed ACP a partir du GMC XLSX + XLSX ERP importe."""
-    # Charger le GMC comme base (remplace l'ancien CSV Integration)
-    gmc_path = find_gmc_file()
-    if not gmc_path:
-        log.append("! Fichier GMC introuvable, impossible de generer l'ACP")
-        return pd.DataFrame(), {}
-    df = pd.read_excel(gmc_path, dtype=str, keep_default_na=False)
     dx = pd.read_excel(io.BytesIO(xlsx_bytes), dtype=str, keep_default_na=False)
     dx["id"] = dx["id"].str.strip()
-    df["id"] = df["id"].str.strip()
+    erp = dx.set_index("id")
+    erp_ids = set(erp.index)
 
-    dx_idx = dx.set_index("id")
-    stats = {}
+    acp_old = load_acp_as_df(ACP_FEED)
 
-    # Détection dynamique des colonnes de liens
-    acp_link_cols = [col for col in ["image_url", "additional_image_urls", "url"] if col in dx.columns]
-    gmc_link_cols = [col for col in ["image link", "additional image link", "link"] if col in df.columns]
-    dx = replace_semicolon_with_comma(dx, acp_link_cols)
-    df = replace_semicolon_with_comma(df, gmc_link_cols)
-    # a) Nouveaux produits
-    new_ids = set(dx["id"]) - set(df["id"])
-    if new_ids:
-        new_rows = dx[dx["id"].isin(new_ids)].copy()
-        # Enrichir descriptions des nouveaux produits avant renommage
-        if "rich_text_description" in new_rows.columns:
-            for idx in new_rows.index:
-                rich = extract_rich_desc(new_rows.at[idx, "rich_text_description"])
-                if rich:
-                    base = new_rows.at[idx, "description"].strip()
-                    if base:
-                        new_rows.at[idx, "description"] = base + " Ses principaux bienfaits : " + rich
-                    else:
-                        new_rows.at[idx, "description"] = "Ses principaux bienfaits : " + rich
-        new_rows.rename(columns={
-            "url": "link", "image_link": "image link",
-            "additional_image_link": "additional image link",
-            "item_group_id": "item group id",
-        }, inplace=True)
-        for col in df.columns:
-            if col not in new_rows.columns:
-                new_rows[col] = ""
-        new_rows["brand"] = "Laboratoire Calebasse"
-        new_rows["condition"] = "new"
-        new_rows["title"] = new_rows["title"].apply(lambda t: " ".join(t.split()))
-        avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
-        new_rows["availability"] = new_rows["availability"].map(avail_map).fillna("out_of_stock")
-        df = pd.concat([df, new_rows[df.columns]], ignore_index=True)
-    stats["nouveaux"] = len(new_ids)
-    log.append(f"+ {len(new_ids)} nouveaux produits")
+    if not acp_old.empty and "item_id" in acp_old.columns:
+        acp_old = acp_old.set_index("item_id")
+        acp_ids = set(acp_old.index)
 
-    # b) Retirer les absents (garder dans un sheet separe)
-    removed_ids = set(df["id"]) - set(dx["id"])
-    removed_df = df[df["id"].isin(removed_ids)].copy() if removed_ids else pd.DataFrame()
-    if removed_ids:
-        df = df[~df["id"].isin(removed_ids)].reset_index(drop=True)
-    stats["retires"] = len(removed_ids)
-    log.append(f"- {len(removed_ids)} produits retires")
+        # Produits retirés (dans ACP mais plus dans ERP)
+        removed_ids = acp_ids - erp_ids
+        removed_df  = acp_old.loc[list(removed_ids)].reset_index() if removed_ids else pd.DataFrame()
 
-    # c) MAJ champs communs
-    common_mask = df["id"].isin(dx_idx.index)
-    common_ids = df.loc[common_mask, "id"]
+        # Mise à jour des produits existants
+        for pid in acp_ids & erp_ids:
+            updated = update_acp_record(acp_old.loc[pid].to_dict(), erp.loc[pid])
+            for col, val in updated.items():
+                if col in acp_old.columns:
+                    acp_old.at[pid, col] = val
 
-    avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
-    new_avail = common_ids.map(lambda i: avail_map.get(dx_idx.loc[i, "availability"], "out_of_stock"))
-    changed_avail = int((df.loc[common_mask, "availability"] != new_avail).sum())
-    df.loc[common_mask, "availability"] = new_avail.values
-    stats["disponibilites"] = changed_avail
-    log.append(f"~ {changed_avail} disponibilites mises a jour")
+        # Nouveaux produits
+        for pid in erp_ids - acp_ids:
+            new_record = {col: "" for col in acp_old.columns}
+            new_record["item_id"] = pid
+            new_record = update_acp_record(new_record, erp.loc[pid])
+            acp_old.loc[pid] = {col: new_record.get(col, "") for col in acp_old.columns}
 
-    new_titles = common_ids.map(lambda i: " ".join(dx_idx.loc[i, "title"].split()))
-    changed_titles = int((df.loc[common_mask, "title"] != new_titles).sum())
-    df.loc[common_mask, "title"] = new_titles.values
-    stats["titres"] = changed_titles
-    log.append(f"~ {changed_titles} titres mis a jour")
+        df = acp_old.reset_index().rename(columns={"index": "item_id"})
+        if "item_id" not in df.columns:
+            df = df.reset_index()
 
-    # Description de base (avant enrichissement)
-    new_descs = common_ids.map(lambda i: dx_idx.loc[i, "description"].strip() if dx_idx.loc[i, "description"] else "")
-    df.loc[common_mask, "description"] = new_descs.where(new_descs != "", df.loc[common_mask, "description"]).values
-
-    new_imgs = common_ids.map(lambda i: dx_idx.loc[i, "image_link"].strip() if dx_idx.loc[i, "image_link"] else "")
-    changed_imgs = int(((new_imgs != "") & (df.loc[common_mask, "image link"] != new_imgs)).sum())
-    df.loc[common_mask, "image link"] = new_imgs.where(new_imgs != "", df.loc[common_mask, "image link"]).values
-    stats["images"] = changed_imgs
-    log.append(f"~ {changed_imgs} images mises a jour")
-
-    new_addimgs = common_ids.map(lambda i: dx_idx.loc[i, "additional_image_link"].strip() if dx_idx.loc[i, "additional_image_link"] else "")
-    df.loc[common_mask, "additional image link"] = new_addimgs.where(
-        new_addimgs != "", df.loc[common_mask, "additional image link"]
-    ).values
-
-    new_urls = common_ids.map(lambda i: dx_idx.loc[i, "url"].strip() if dx_idx.loc[i, "url"] else "")
-    changed_urls = int(((new_urls != "") & (df.loc[common_mask, "link"] != new_urls)).sum())
-    df.loc[common_mask, "link"] = new_urls.where(new_urls != "", df.loc[common_mask, "link"]).values
-    stats["urls"] = changed_urls
-    log.append(f"~ {changed_urls} URLs mises a jour")
-
-    new_grps = common_ids.map(lambda i: dx_idx.loc[i, "item_group_id"].strip() if dx_idx.loc[i, "item_group_id"] else "")
-    df.loc[common_mask, "item group id"] = new_grps.where(new_grps != "", df.loc[common_mask, "item group id"]).values
-
-    # Shipping weight
-    df["_shipping_weight"] = ""
-    new_weights = common_ids.map(lambda i: dx_idx.loc[i, "shipping_weight"].strip() if dx_idx.loc[i, "shipping_weight"] else "")
-    df.loc[common_mask, "_shipping_weight"] = new_weights.values
-    if new_ids:
-        new_mask = df["id"].isin(new_ids)
-        if new_mask.any():
-            df.loc[new_mask, "_shipping_weight"] = df.loc[new_mask, "id"].map(
-                lambda i: dx_idx.loc[i, "shipping_weight"].strip() if i in dx_idx.index and dx_idx.loc[i, "shipping_weight"] else ""
-            ).values
-
-    # Rich text description (compatible 12 ou 13 colonnes)
-    df["_rich_desc"] = ""
-    if "rich_text_description" in dx_idx.columns:
-        rich_descs = common_ids.map(lambda i: extract_rich_desc(dx_idx.loc[i, "rich_text_description"]) if dx_idx.loc[i, "rich_text_description"] else "")
-        df.loc[common_mask, "_rich_desc"] = rich_descs.values
-
-    # Category
-    df["_xlsx_category"] = ""
-    cats = common_ids.map(lambda i: dx_idx.loc[i, "category"].strip() if dx_idx.loc[i, "category"] else "")
-    df.loc[common_mask, "_xlsx_category"] = cats.values
-
-    # --- Renommer colonnes ---
-    rename_map = {
-        "id": "item_id", "link": "url", "image link": "image_url",
-        "additional image link": "additional_image_urls",
-        "item group id": "group_id", "product_type": "product_category",
-        "sale price": "sale_price",
-        "sale price effective date": "sale_price_effective_date",
-        "availability date": "availability_date",
-        "expiration date": "expiration_date",
-        "age group": "age_group", "size system": "size_system",
-        "unit pricing measure": "unit_pricing_measure",
-        "unit pricing base measure": "unit_pricing_base_measure",
-    }
-    df.rename(columns=rename_map, inplace=True)
-
-    # Enrichir descriptions : description + "Ses principaux bienfaits : " + rich_text
-    mask = (df["description"] == "") & (df["_rich_desc"] != "")
-    df.loc[mask, "description"] = "Ses principaux bienfaits : " + df.loc[mask, "_rich_desc"]
-    mask2 = (df["description"] != "") & (df["_rich_desc"] != "")
-    df.loc[mask2, "description"] = df.loc[mask2, "description"] + " Ses principaux bienfaits : " + df.loc[mask2, "_rich_desc"]
-
-    # Category fallback
-    if "_xlsx_category" in df.columns and "product_category" in df.columns:
-        mask = (df["product_category"] == "") & (df["_xlsx_category"] != "")
-        df.loc[mask, "product_category"] = df.loc[mask, "_xlsx_category"]
-
-    # Supprimer colonnes Google-only
-    cols_to_drop = [
-        "mobile link", "identifier exists", "product highlight",
-        "product detail", "pattern", "is bundle",
-        "energy efficiency class", "min energy efficiency class",
-        "sell on google quantity", "google_product_category",
-        "adult", "size type",
-    ]
-    df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
-
-    # Prix
-    df["price"] = df["price"].apply(fix_price)
-    if "sale_price" in df.columns:
-        df["sale_price"] = df["sale_price"].apply(fix_price)
-
-    # ACP required fields
-    df["is_eligible_search"] = "true"
-    df["is_eligible_checkout"] = "true"
-    df["seller_name"] = "Laboratoire Calebasse"
-    df["seller_url"] = "https://calebasse.com"
-    df["seller_privacy_policy"] = "https://calebasse.com/politique-confidentialite"
-    df["seller_tos"] = "https://calebasse.com/cgv"
-    df["target_countries"] = "FR,AL,DE,AD,AT,BE,BY,BA,BG,CY,HR,DK,ES,ES,IC,EA,IC,EA,EE,FI,CP,GF,MQ,YT,NC,PF,RE,BL,SM,PM,TF,WF,GR,HK,HU,IE,IS,IT,KZ,XK,LV,LT,LU,MK,MT,MD,MC,ME,NO,NL,PL,PT,CZ,RO,GB,SK,SE,CH,VA"
-    df["store_country"] = "FR"
-
-    # MPN : sku-{item_id}
-    df["mpn"] = df["item_id"].apply(lambda x: "sku-" + x.strip() if x.strip() else "")
-
-    group_counts = df[df["group_id"] != ""].groupby("group_id")["item_id"].count()
-    multi = set(group_counts[group_counts > 1].index)
-    df["listing_has_variations"] = df["group_id"].apply(lambda g: "true" if g in multi else "false")
-    df["return_policy"] = "https://calebasse.com/cgv"
-
-    # sale_price_effective_date split
-    if "sale_price_effective_date" in df.columns:
-        def split_date(val, idx):
-            if not val or "/" not in val:
-                return ""
-            parts = val.split("/")
-            return parts[idx].strip() if idx < len(parts) else ""
-        df["sale_price_start_date"] = df["sale_price_effective_date"].apply(lambda v: split_date(v, 0))
-        df["sale_price_end_date"] = df["sale_price_effective_date"].apply(lambda v: split_date(v, 1))
-        df.drop(columns=["sale_price_effective_date"], inplace=True)
-
-    # Variants
-    df["variant_dict"] = df["title"].apply(build_variant_dict)
-    df["item_group_title"] = df["title"].apply(build_group_title)
-    df["custom_variant1_category"] = "Format"
-    df["custom_variant1_option"] = df["title"].apply(get_custom_variant_format)
-    df["custom_variant2_category"] = "Poids"
-    df["custom_variant2_option"] = df["title"].apply(get_weight_from_title)
-    df["custom_variant3_category"] = ""
-    df["custom_variant3_option"] = ""
-
-    # Optional defaults
-    df["shipping"] = "FR:::0.00 EUR:2-5 days"
-    df["is_digital"] = "false"
-    df["accepts_returns"] = "true"
-    df["return_deadline_in_days"] = "14"
-    df["accepts_exchanges"] = "true"
-    df["warning"] = WARNING_STANDARD
-    df["age_restriction"] = "12"
-    for col in ["video_url", "model_3d_url", "dimensions", "length", "width", "height",
-                "dimensions_unit", "pricing_trend", "unit_pricing_measure",
-                "unit_pricing_base_measure", "pickup_sla"]:
-        if col not in df.columns:
-            df[col] = ""
-    if "pickup_method" not in df.columns:
-        df["pickup_method"] = "in_store"
-    df["marketplace_seller"] = ""
-    df["offer_id"] = ""
-    df["popularity_score"] = ""
-    df["return_rate"] = ""
-    df["review_count"] = ""
-    df["star_rating"] = ""
-    df["store_review_count"] = ""
-    df["store_star_rating"] = ""
-    df["q_and_a"] = json.dumps(QA_LIST, ensure_ascii=False)
-    df["reviews"] = ""
-
-    # Weight
-    df["weight"] = df["title"].apply(get_weight_from_title)
-    no_weight = df["weight"] == ""
-    has_w = df["_shipping_weight"] != ""
-    df.loc[no_weight & has_w, "weight"] = df.loc[no_weight & has_w, "_shipping_weight"].apply(
-        lambda w: str(int(float(w))) + "g" if w else ""
-    )
-    df["item_weight_unit"] = df["weight"].apply(lambda w: "g" if w else "")
-    df["weight"] = df["weight"].apply(lambda w: w.replace("g", "") if w else "")
-
-    # Related products
-    if os.path.exists(RELATED_JSON):
-        with open(RELATED_JSON, "r", encoding="utf-8") as f:
-            related_map = json.load(f)
-        df["related_product_id"] = df["group_id"].apply(
-            lambda g: ",".join(related_map[g]) if g in related_map else ""
-        )
-        df["relationship_type"] = df["related_product_id"].apply(
-            lambda r: "often_bought_with" if r else ""
-        )
     else:
-        df["related_product_id"] = ""
-        df["relationship_type"] = ""
+        # Première création
+        rows = []
+        for pid, src_row in erp.iterrows():
+            record = {col: "" for col in ACP_COLUMNS}
+            record["item_id"] = pid
+            record = update_acp_record(record, src_row)
+            rows.append(record)
+        df = pd.DataFrame(rows, columns=ACP_COLUMNS)
+        removed_df = pd.DataFrame()
 
-    df["geo_price"] = ""
-    df["geo_availability"] = ""
-
-    # GTIN from barcodes
-    barcodes = extract_barcodes()
-    if barcodes:
-        # item_id dans ACP = ancien id (sku)
-        if "gtin" not in df.columns:
-            df["gtin"] = ""
-        for idx, row in df.iterrows():
-            item_id = row["item_id"]
-            # Chercher le sku dans les barcodes (item_id commence parfois par le sku)
-            if item_id in barcodes and not df.at[idx, "gtin"]:
-                df.at[idx, "gtin"] = barcodes[item_id]
-            # Aussi chercher via mpn (sku-XXX -> XXX)
-            mpn = row.get("mpn", "")
-            if mpn:
-                sku_from_mpn = mpn.replace("sku-", "") if mpn.startswith("sku-") else mpn
-                if sku_from_mpn in barcodes and not df.at[idx, "gtin"]:
-                    df.at[idx, "gtin"] = barcodes[sku_from_mpn]
-        gtin_count = (df["gtin"] != "").sum()
-        stats["gtin"] = int(gtin_count)
-        log.append(f"= {gtin_count} codes-barres GTIN remplis")
-
-    # Supprimer colonnes temp
-    for tmp in ["_shipping_weight", "_rich_desc", "_xlsx_category"]:
-        if tmp in df.columns:
-            df.drop(columns=[tmp], inplace=True)
-
-    # identifier_exists en fonction du gtin
-    if "gtin" in df.columns:
-        df["identifier_exists"] = df["gtin"].apply(lambda g: "true" if g and g.strip() else "false")
-
-    # Ordonner les 77 colonnes
-    for col in ACP_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[ACP_COLUMNS]
-
-    stats["total"] = len(df)
-    log.append(f"= {len(df)} produits, {len(df.columns)} colonnes")
+    stats = {
+        "total"    : len(df),
+        "nouveaux" : len(erp_ids - (set(acp_old.index) if not acp_old.empty else set())),
+        "retires"  : len(removed_df),
+    }
+    log.append(f"ACP: {len(df)} produits ({stats['nouveaux']} nouveaux, {stats['retires']} retirés)")
     return df, stats, removed_df
-    def replace_semicolon_with_comma(df, columns):
-        """Remplace les points-virgules par des virgules dans les colonnes de liens."""
-        for col in columns:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: x.replace(';', ',') if isinstance(x, str) else x)
-        return df
-        # Correction des points-virgules dans les colonnes de liens
-        link_cols = ["image_url", "additional_image_urls", "url"]
-        df = replace_semicolon_with_comma(df, link_cols)
+
+
+# ============================================================
+# GÉNÉRATION GMC — BUG 5,6,7,8,12,13,14,15 corrigés
+# ============================================================
+
+
+def load_gmc_as_df(path):
+    """Lit le fichier GMC via openpyxl (préserve les labels HYPERLINK) et retourne un DataFrame."""
+    headers, data = read_gmc_openpyxl(path)
+    if not data:
+        return pd.DataFrame()
+    return pd.DataFrame(data, columns=headers)
+
+
+def save_gmc_from_df(df, path):
+    """Réécrit le fichier GMC en préservant les en-têtes HYPERLINK d'origine."""
+    wb = load_workbook(path)
+    main_sheet = next((sn for sn in wb.sheetnames if sn not in ("Produits_retirés","exad")), wb.sheetnames[0])
+    ws = wb[main_sheet]
+
+    # Supprimer les données (ligne 2+), garder ligne 1 (HYPERLINK headers)
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    normal_font = Font(name="Arial", size=10)
+    # Récupérer l'ordre des colonnes depuis les headers actuels du fichier
+    headers = [extract_hyperlink_label(ws.cell(1,c).value) for c in range(1, ws.max_column+1)]
+
+    for _, row in df.iterrows():
+        ws.append([row.get(h, "") for h in headers])
+
+    for ws_row in ws.iter_rows(min_row=2):
+        for cell in ws_row:
+            cell.font = normal_font
+
+    wb.save(path)
+
+def update_gmc_record(record, src):
+    """
+    Met à jour un enregistrement GMC depuis l'ERP.
+    Respecte strictement GMC_MANAGED — les autres colonnes ne sont PAS touchées.
+    """
+    updated = record.copy()
+
+    # Champs directs
+    for gmc_col, erp_col in GMC_FIELD_MAP.items():
+        val = src.get(erp_col, None)
+        if gmc_col == "additional image link":
+            updated[gmc_col] = convert_links(val)     # BUG 13 corrigé
+        else:
+            updated[gmc_col] = "" if is_empty(val) else str(val).strip()
+
+    # Champs spéciaux
+    updated["description"] = build_description(
+        src.get("description", ""), src.get("rich_text_description", "")
+    )
+    updated["availability"] = normalize_availability(src.get("availability", ""))  # BUG 15 corrigé
+    updated["price"] = format_price(src.get("price", ""))                           # BUG 12 corrigé (une seule fois)
+    sale_raw = src.get("sale_price", "")   # ERP utilise underscore
+    updated["sale price"] = format_price(sale_raw) if not is_empty(sale_raw) else ""
+
+    return updated
 
 
 def generate_gmc(xlsx_bytes, log):
-    """Generer le fichier GMC mis a jour."""
-    gmc_path = find_gmc_file()
-    if not gmc_path:
-        log.append("! Fichier GMC introuvable")
-        return None, {}
-
-    gmc = pd.read_excel(gmc_path, dtype=str, keep_default_na=False)
+    # Charger ERP
     dx = pd.read_excel(io.BytesIO(xlsx_bytes), dtype=str, keep_default_na=False)
     dx["id"] = dx["id"].str.strip()
-    gmc["id"] = gmc["id"].str.strip()
+    erp = dx.set_index("id")
+    erp_ids = set(erp.index)
 
-    dx_idx = dx.set_index("id")
-    stats = {}
+    gmc_path = find_gmc_file()
 
-    # a) Nouveaux produits
-    new_ids = set(dx["id"]) - set(gmc["id"])
-    if new_ids:
-        new_rows = dx[dx["id"].isin(new_ids)].copy()
-        # Enrichir descriptions des nouveaux produits avant renommage
-        if "rich_text_description" in new_rows.columns:
-            for idx in new_rows.index:
-                rich = extract_rich_desc(new_rows.at[idx, "rich_text_description"])
-                if rich:
-                    base = new_rows.at[idx, "description"].strip()
-                    if base:
-                        new_rows.at[idx, "description"] = base + " Ses principaux bienfaits : " + rich
-                    else:
-                        new_rows.at[idx, "description"] = "Ses principaux bienfaits : " + rich
-        rename_cols = {
-            "url": "link", "image_link": "image link",
-            "additional_image_link": "additional image link",
-            "item_group_id": "item group id",
-            "sale_price": "sale price",
-            "shipping_weight": "shipping_weight_tmp",
-            "category": "category_tmp",
+    if gmc_path and os.path.exists(gmc_path):
+        # Lire via openpyxl pour préserver les HYPERLINK headers (BUG 6,7,8 corrigés)
+        headers, gmc_data = read_gmc_openpyxl(gmc_path)
+        gmc_ids = {str(r.get("id","")).strip() for r in gmc_data}
+        gmc_ids.discard("")
+
+        removed_ids = gmc_ids - erp_ids
+        active_rows = []
+        removed_rows = []
+
+        for record in gmc_data:
+            pid = str(record.get("id","")).strip()
+            if not pid:
+                continue
+            if pid in removed_ids:
+                removed_rows.append(record)
+                continue
+            if pid in erp_ids:
+                record = update_gmc_record(record, erp.loc[pid])
+            active_rows.append(record)
+
+        # Nouveaux produits (dans ERP mais pas dans GMC)
+        new_ids = erp_ids - gmc_ids
+        for pid in new_ids:
+            src = erp.loc[pid]
+            new_record = {h: "" for h in headers}
+            new_record["id"] = pid
+            new_record = update_gmc_record(new_record, src)
+            active_rows.append(new_record)
+
+        removed_df = pd.DataFrame(removed_rows, columns=headers) if removed_rows else pd.DataFrame()
+
+        stats = {
+            "total": len(active_rows),
+            "nouveaux": len(new_ids),
+            "retires": len(removed_rows),
         }
-        if "rich_text_description" in new_rows.columns:
-            rename_cols["rich_text_description"] = "rich_text_tmp"
-        new_rows.rename(columns=rename_cols, inplace=True)
-        for col in gmc.columns:
-            if col not in new_rows.columns:
-                new_rows[col] = ""
-        new_rows["brand"] = "Laboratoire Calebasse"
-        new_rows["condition"] = "new"
-        new_rows["title"] = new_rows["title"].apply(lambda t: " ".join(t.split()))
-        new_rows["identifier exists"] = "no"
-        new_rows["adult"] = "no"
-        avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
-        new_rows["availability"] = new_rows["availability"].map(avail_map).fillna("out_of_stock")
-        gmc = pd.concat([gmc, new_rows[gmc.columns]], ignore_index=True)
-    stats["nouveaux"] = len(new_ids)
-    log.append(f"GMC: + {len(new_ids)} nouveaux produits")
+        log.append(f"GMC: {len(active_rows)} produits ({len(new_ids)} nouveaux, {len(removed_rows)} retirés)")
 
-    # b) Retirer absents (garder dans un sheet separe)
-    removed_ids = set(gmc["id"]) - set(dx["id"])
-    gmc_removed_df = gmc[gmc["id"].isin(removed_ids)].copy() if removed_ids else pd.DataFrame()
-    if removed_ids:
-        gmc = gmc[~gmc["id"].isin(removed_ids)].reset_index(drop=True)
-    stats["retires"] = len(removed_ids)
-    log.append(f"GMC: - {len(removed_ids)} produits retires")
+        # Écrire le résultat en préservant les HYPERLINK headers (BUG 5 corrigé)
+        import shutil
+        shutil.copy2(gmc_path, gmc_path + ".bak")
+        wb = load_workbook(gmc_path)
+        # Trouver la feuille principale
+        main_sheet_name = next((sn for sn in wb.sheetnames if sn not in ("Produits_retirés","exad")), wb.sheetnames[0])
+        ws = wb[main_sheet_name]
 
-    # c) MAJ champs communs
-    common_mask = gmc["id"].isin(dx_idx.index)
-    common_ids = gmc.loc[common_mask, "id"]
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row - 1)
 
-    avail_map = {"AVAILABLE": "in_stock", "OUT_OF_STOCK": "out_of_stock", "AVAILABLE_SOON": "out_of_stock"}
-    new_avail = common_ids.map(lambda i: avail_map.get(dx_idx.loc[i, "availability"], "out_of_stock"))
-    changed_avail = int((gmc.loc[common_mask, "availability"] != new_avail).sum())
-    gmc.loc[common_mask, "availability"] = new_avail.values
-    stats["disponibilites"] = changed_avail
-    log.append(f"GMC: ~ {changed_avail} disponibilites")
+        normal_font = Font(name="Arial", size=10)
 
-    new_titles = common_ids.map(lambda i: " ".join(dx_idx.loc[i, "title"].split()))
-    changed_titles = int((gmc.loc[common_mask, "title"] != new_titles).sum())
-    gmc.loc[common_mask, "title"] = new_titles.values
-    stats["titres"] = changed_titles
-    log.append(f"GMC: ~ {changed_titles} titres")
+        def make_row(record, hdrs):
+            return [record.get(h, "") for h in hdrs]
 
-    # Description de base (avant enrichissement)
-    new_descs = common_ids.map(lambda i: dx_idx.loc[i, "description"].strip() if dx_idx.loc[i, "description"] else "")
-    gmc.loc[common_mask, "description"] = new_descs.where(new_descs != "", gmc.loc[common_mask, "description"]).values
+        for record in active_rows:
+            ws.append(make_row(record, headers))
 
-    new_imgs = common_ids.map(lambda i: dx_idx.loc[i, "image_link"].strip() if dx_idx.loc[i, "image_link"] else "")
-    gmc.loc[common_mask, "image link"] = new_imgs.where(new_imgs != "", gmc.loc[common_mask, "image link"]).values
+        for ws_row in ws.iter_rows(min_row=2):
+            for cell in ws_row:
+                cell.font = normal_font
 
-    new_addimgs = common_ids.map(lambda i: dx_idx.loc[i, "additional_image_link"].strip() if dx_idx.loc[i, "additional_image_link"] else "")
-    gmc.loc[common_mask, "additional image link"] = new_addimgs.where(
-        new_addimgs != "", gmc.loc[common_mask, "additional image link"]
-    ).values
+        # Feuille Produits_retirés
+        removed_sheet = "Produits_retirés"
+        if removed_sheet in wb.sheetnames:
+            ws_r = wb[removed_sheet]
+            existing_ids = {str(ws_r.cell(r, 1).value or "").strip() for r in range(2, ws_r.max_row+1)}
+            for record in removed_rows:
+                if str(record.get("id","")).strip() not in existing_ids:
+                    ws_r.append(make_row(record, headers))
+        else:
+            ws_r = wb.create_sheet(removed_sheet)
+            ws_r.append(headers)
+            for cell in ws_r[1]:
+                cell.font = Font(name="Arial", size=10, bold=True)
+                cell.fill = PatternFill("solid", start_color="FFD700")
+            for record in removed_rows:
+                ws_r.append(make_row(record, headers))
 
-    new_urls = common_ids.map(lambda i: dx_idx.loc[i, "url"].strip() if dx_idx.loc[i, "url"] else "")
-    gmc.loc[common_mask, "link"] = new_urls.where(new_urls != "", gmc.loc[common_mask, "link"]).values
+        for ws_row in ws_r.iter_rows(min_row=2):
+            for cell in ws_row:
+                cell.font = normal_font
 
-    new_grps = common_ids.map(lambda i: dx_idx.loc[i, "item_group_id"].strip() if dx_idx.loc[i, "item_group_id"] else "")
-    gmc.loc[common_mask, "item group id"] = new_grps.where(new_grps != "", gmc.loc[common_mask, "item group id"]).values
+        wb.save(gmc_path)
+        log.append(f"GMC sauvegardé : {gmc_path}")
 
-    # Prix
-    new_prices = common_ids.map(lambda i: dx_idx.loc[i, "price"].strip() if dx_idx.loc[i, "price"] else "")
-    gmc.loc[common_mask, "price"] = new_prices.where(new_prices != "", gmc.loc[common_mask, "price"]).values
+        # Retourner un DataFrame pour l'affichage
+        gmc_df = pd.DataFrame(active_rows, columns=headers) if active_rows else pd.DataFrame()
+        return gmc_df, stats, removed_df
 
-    # Sale price : ERP fait autorite (ecrase meme si vide pour retirer les promos expirees)
-    if "sale_price" in dx_idx.columns and "sale price" in gmc.columns:
-        new_sale = common_ids.map(lambda i: dx_idx.loc[i, "sale_price"].strip() if dx_idx.loc[i, "sale_price"] else "")
-        gmc.loc[common_mask, "sale price"] = new_sale.values
-
-    # Description enrichie : description + "Ses principaux bienfaits : " + rich_text
-    if "description" in gmc.columns and "rich_text_description" in dx_idx.columns:
-        rich_descs = common_ids.map(
-            lambda i: extract_rich_desc(dx_idx.loc[i, "rich_text_description"])
-            if dx_idx.loc[i, "rich_text_description"] else ""
-        )
-        mask_empty = (gmc.loc[common_mask, "description"] == "") & (rich_descs != "")
-        gmc.loc[common_mask & mask_empty.values, "description"] = "Ses principaux bienfaits : " + rich_descs[mask_empty].values
-        mask_both = (gmc.loc[common_mask, "description"] != "") & (rich_descs != "") & (~mask_empty)
-        if mask_both.any():
-            idxs = common_mask & mask_both.values
-            gmc.loc[idxs, "description"] = gmc.loc[idxs, "description"] + " Ses principaux bienfaits : " + rich_descs[mask_both].values
-
-    # GTIN from barcodes
-    barcodes = extract_barcodes()
-    if barcodes and "gtin" in gmc.columns:
-        for idx, row in gmc.iterrows():
-            item_id = row["id"]
-            if item_id in barcodes and not gmc.at[idx, "gtin"]:
-                gmc.at[idx, "gtin"] = barcodes[item_id]
-            mpn = row.get("mpn", "")
-            if mpn:
-                sku = mpn.replace("sku-", "") if mpn.startswith("sku-") else mpn
-                if sku in barcodes and not gmc.at[idx, "gtin"]:
-                    gmc.at[idx, "gtin"] = barcodes[sku]
-
-    # MPN : sku-{id}
-    if "mpn" in gmc.columns:
-        gmc["mpn"] = gmc["id"].apply(lambda x: "sku-" + x.strip() if x.strip() else "")
-
-    # identifier exists en fonction du gtin
-    if "gtin" in gmc.columns and "identifier exists" in gmc.columns:
-        gmc["identifier exists"] = gmc["gtin"].apply(lambda g: "yes" if g and g.strip() else "no")
-
-    # Prix : format "X,XX EUR"
-    if "price" in gmc.columns:
-        gmc["price"] = gmc["price"].apply(fix_price)
-    if "sale price" in gmc.columns:
-        gmc["sale price"] = gmc["sale price"].apply(fix_price)
-
-    stats["total"] = len(gmc)
-    log.append(f"GMC: = {len(gmc)} produits, {len(gmc.columns)} colonnes")
-    return gmc, stats, gmc_removed_df
+    else:
+        log.append("Aucun fichier GMC trouvé dans 'Files to update'")
+        return None, {"total": 0, "nouveaux": 0, "retires": 0}, pd.DataFrame()
 
 
 # ============================================================
-# HELPERS: Charts & stats for preview
+# HELPERS UI
 # ============================================================
 
 def html_bar_chart(labels, values, color="#89B832"):
-    """Render a bar chart as HTML (avoids altair dependency)."""
     if not values:
         return
     max_val = max(values) if max(values) > 0 else 1
@@ -659,21 +613,19 @@ def html_bar_chart(labels, values, color="#89B832"):
             </div>
             <div style="width:60px;font-size:13px;font-weight:600;color:#1A1A1A;padding-left:10px;">{val}</div>
         </div>"""
-    st.markdown(bars_html, unsafe_allow_html=True)
+    st.markdown(f'<div style="margin:8px 0;">{bars_html}</div>', unsafe_allow_html=True)
 
 
 def html_histogram(prices_series, bins=15, color="#89B832"):
-    """Render a price histogram as HTML."""
     if prices_series.empty:
         return
     cuts = pd.cut(prices_series, bins=bins)
     hist = cuts.value_counts().sort_index()
     labels = [f"{iv.left:.0f}-{iv.right:.0f}" for iv in hist.index]
-    values = hist.values.tolist()
-    html_bar_chart(labels, values, color)
+    html_bar_chart(labels, hist.values.tolist(), color)
+
 
 def column_fill_stats(df):
-    """Compute fill rate per column."""
     rows = []
     for col in df.columns:
         non_empty = (df[col] != "").sum()
@@ -687,7 +639,6 @@ def column_fill_stats(df):
 
 
 def availability_stats(df, col="availability"):
-    """Count availability values."""
     if col not in df.columns:
         return pd.DataFrame()
     counts = df[col].value_counts().reset_index()
@@ -696,10 +647,12 @@ def availability_stats(df, col="availability"):
 
 
 def price_stats(df, col="price"):
-    """Basic price distribution."""
     if col not in df.columns:
         return {}
-    raw = df[col].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True)
+    raw = (df[col]
+           .str.replace(r"\s*EUR\s*$", "", regex=True)
+           .str.replace(",", ".")
+           .str.replace(r"[^\d.]", "", regex=True))
     prices = pd.to_numeric(raw, errors="coerce").dropna()
     if prices.empty:
         return {}
@@ -713,7 +666,7 @@ def price_stats(df, col="price"):
 
 
 # ============================================================
-# STREAMLIT UI
+# STREAMLIT — Configuration
 # ============================================================
 
 st.set_page_config(
@@ -726,17 +679,16 @@ st.set_page_config(
 # AUTHENTIFICATION
 # ============================================================
 USERS = {
-    "admin": hashlib.sha256("Calebasse2026!".encode()).hexdigest(),
-    "calebasse": hashlib.sha256("feeds@Lab".encode()).hexdigest(),
+    "admin":      hashlib.sha256("Calebasse2026!".encode()).hexdigest(),
+    "calebasse":  hashlib.sha256("feeds@Lab".encode()).hexdigest(),
 }
+
 
 def check_login():
     if st.session_state.get("authenticated"):
         return True
     st.markdown("""
-    <style>
-        [data-testid="stSidebar"] { display: none !important; }
-    </style>
+    <style>[data-testid="stSidebar"] { display: none !important; }</style>
     """, unsafe_allow_html=True)
     col_l, col_c, col_r = st.columns([1, 2, 1])
     with col_c:
@@ -762,141 +714,55 @@ def check_login():
         st.markdown('<div style="text-align:center;margin-top:40px;font-size:12px;color:#bbb;">Laboratoire Calebasse &copy; 2026</div>', unsafe_allow_html=True)
     return False
 
+
 if not check_login():
     st.stop()
 
-# --- Calebasse Design System (CSS complement au theme config.toml) ---
+# ============================================================
+# CSS
+# ============================================================
 st.markdown("""
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
-    /* Force light theme (override browser localStorage preference) */
     :root, [data-testid="stAppViewContainer"], [data-testid="stHeader"],
     [data-testid="stSidebar"], .main, .block-container,
     [data-testid="stAppViewBlockContainer"] {
         background-color: #F9F9F7 !important;
         color: #1A1A1A !important;
     }
-    [data-testid="stSidebar"] {
-        background-color: #FFFFFF !important;
-    }
+    [data-testid="stSidebar"] { background-color: #FFFFFF !important; }
     section[data-testid="stSidebar"] .stMarkdown,
     .main .stMarkdown, .main p, .main span, .main label, .main li,
-    .main h1, .main h2, .main h3, .main h4 {
-        color: #1A1A1A !important;
-    }
-    [data-testid="stExpander"] {
-        background-color: #FFFFFF !important;
-        border-color: #E5E5E5 !important;
-    }
-    [data-testid="stExpander"] summary span,
-    [data-testid="stExpander"] p {
-        color: #1A1A1A !important;
-    }
-    .stDataFrame, [data-testid="stTable"] {
-        background-color: #FFFFFF !important;
-    }
-    [data-testid="stFileUploader"] {
-        background-color: #FFFFFF !important;
-        border-color: #E5E5E5 !important;
-    }
-    [data-testid="stFileUploader"] label,
-    [data-testid="stFileUploader"] span,
-    [data-testid="stFileUploader"] p {
-        color: #1A1A1A !important;
-    }
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        background-color: transparent !important;
-    }
-    .stTabs [data-baseweb="tab"] {
-        color: #1A1A1A !important;
-    }
-
-    /* Primary button */
+    .main h1, .main h2, .main h3, .main h4 { color: #1A1A1A !important; }
+    [data-testid="stExpander"] { background-color: #FFFFFF !important; border-color: #E5E5E5 !important; }
+    [data-testid="stExpander"] summary span, [data-testid="stExpander"] p { color: #1A1A1A !important; }
+    .stDataFrame, [data-testid="stTable"] { background-color: #FFFFFF !important; }
+    [data-testid="stFileUploader"] { background-color: #FFFFFF !important; border-color: #E5E5E5 !important; }
+    [data-testid="stFileUploader"] label, [data-testid="stFileUploader"] span,
+    [data-testid="stFileUploader"] p { color: #1A1A1A !important; }
+    .stTabs [data-baseweb="tab-list"] { background-color: transparent !important; }
+    .stTabs [data-baseweb="tab"] { color: #1A1A1A !important; }
+    .stTabs [aria-selected="true"] { color: #89B832 !important; border-bottom-color: #89B832 !important; }
     .stButton > button[kind="primary"],
     .stButton > button[data-testid="stBaseButton-primary"] {
-        background-color: #89B832 !important;
-        border-color: #89B832 !important;
-        color: white !important;
+        background-color: #89B832 !important; border-color: #89B832 !important; color: white !important;
     }
-    .stButton > button[kind="primary"]:hover,
-    .stButton > button[data-testid="stBaseButton-primary"]:hover {
-        background-color: #7aa52b !important;
-        border-color: #7aa52b !important;
-    }
-
-    /* Download buttons */
-    .stDownloadButton > button {
-        border-color: #89B832 !important;
-        color: #89B832 !important;
-    }
-    .stDownloadButton > button:hover {
-        background-color: #f3fbe8 !important;
-    }
-
-    /* Header */
-    .calebasse-header {
-        border-bottom: 3px solid #89B832;
-        padding-bottom: 16px;
-        margin-bottom: 28px;
-    }
-    .calebasse-header h1 {
-        font-family: Georgia, serif;
-        color: #89B832;
-        margin: 0;
-        font-size: 34px;
-    }
-    .calebasse-header p {
-        margin: 4px 0 0;
-        color: #666;
-        font-style: italic;
-        font-size: 15px;
-    }
-
-    /* Section titles */
-    .section-title {
-        font-family: Georgia, serif;
-        border-bottom: 1px solid #ddd;
-        padding-bottom: 8px;
-        color: #1A1A1A;
-        font-size: 22px;
-        margin-top: 28px;
-    }
-
-    /* Metrics */
-    [data-testid="stMetricValue"] {
-        color: #89B832 !important;
-        font-weight: 700 !important;
-    }
-
-    /* Success box */
-    .success-box {
-        background: #f3fbe8;
-        border: 1px solid #89B832;
-        border-radius: 6px;
-        padding: 14px 18px;
-        margin: 16px 0;
-        font-weight: 600;
-        color: #3d5a0f;
-    }
-
-    /* Active tab */
-    .stTabs [aria-selected="true"] {
-        color: #89B832 !important;
-        border-bottom-color: #89B832 !important;
-    }
-
-    /* Footer */
-    .calebasse-footer {
-        margin-top: 50px;
-        text-align: center;
-        font-size: 13px;
-        color: #999;
-    }
+    .stButton > button[kind="primary"]:hover { background-color: #7aa52b !important; border-color: #7aa52b !important; }
+    .stDownloadButton > button { border-color: #89B832 !important; color: #89B832 !important; }
+    .stDownloadButton > button:hover { background-color: #f3fbe8 !important; }
+    .calebasse-header { border-bottom: 3px solid #89B832; padding-bottom: 16px; margin-bottom: 28px; }
+    .calebasse-header h1 { font-family: Georgia, serif; color: #89B832; margin: 0; font-size: 34px; }
+    .calebasse-header p { margin: 4px 0 0; color: #666; font-style: italic; font-size: 15px; }
+    .section-title { font-family: Georgia, serif; border-bottom: 1px solid #ddd; padding-bottom: 8px; color: #1A1A1A; font-size: 22px; margin-top: 28px; }
+    [data-testid="stMetricValue"] { color: #89B832 !important; font-weight: 700 !important; }
+    .success-box { background: #f3fbe8; border: 1px solid #89B832; border-radius: 6px; padding: 14px 18px; margin: 16px 0; font-weight: 600; color: #3d5a0f; }
+    .calebasse-footer { margin-top: 50px; text-align: center; font-size: 13px; color: #999; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- Sidebar Navigation ---
+# ============================================================
+# SIDEBAR
+# ============================================================
 with st.sidebar:
     st.markdown("""
     <div style="text-align:center; padding: 10px 0 20px;">
@@ -911,7 +777,6 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     st.markdown("---")
-    # Sidebar file status summary
     acp_exists = os.path.exists(ACP_FEED)
     gmc_exists = find_gmc_file() is not None
     st.markdown("**Fichiers detectes**")
@@ -924,18 +789,8 @@ with st.sidebar:
         st.session_state["username"] = ""
         st.rerun()
 
-# --- Header ---
-st.markdown("""
-<div class="calebasse-header">
-    <h1>Laboratoire Calebasse</h1>
-    <p>Mise a jour automatique des feeds ACP OpenAI & Google Merchant Center</p>
-</div>
-""", unsafe_allow_html=True)
+st.markdown('<div class="calebasse-header"><h1>Calebasse - Mise à jour des feeds</h1><p>Outil de gestion des feeds ACP & GMC</p></div>', unsafe_allow_html=True)
 
-# Verifier fichiers statiques
-if not find_gmc_file():
-    st.error("Fichier manquant : Flux Google Merchant Center XLSX")
-    st.stop()
 
 # ============================================================
 # PAGE 1 : Importer le fichier Export ERP
@@ -952,17 +807,15 @@ if page == "Importer le fichier Export ERP":
     if uploaded:
         xlsx_bytes = uploaded.read()
 
-        # Preview
-        preview = pd.read_excel(io.BytesIO(xlsx_bytes), dtype=str, nrows=5)
-        with st.expander(f"Apercu du fichier importe ({len(pd.read_excel(io.BytesIO(xlsx_bytes), dtype=str))} lignes, {len(preview.columns)} colonnes)", expanded=False):
-            st.dataframe(preview, width="stretch")
+        preview_df = pd.read_excel(io.BytesIO(xlsx_bytes), dtype=str, nrows=5)
+        total_rows = len(pd.read_excel(io.BytesIO(xlsx_bytes), dtype=str))
+        with st.expander(f"Apercu du fichier importe ({total_rows} lignes, {len(preview_df.columns)} colonnes)", expanded=False):
+            st.dataframe(preview_df, use_container_width=True)
 
         st.markdown("---")
 
-        # Generate button
-        if st.button("Mettre a jour les feeds", type="primary", width="stretch"):
-            acp_log = []
-            gmc_log = []
+        if st.button("Mettre a jour les feeds", type="primary", use_container_width=True):
+            acp_log, gmc_log = [], []
 
             with st.spinner("Generation du feed ACP OpenAI..."):
                 acp_df, acp_stats, acp_removed = generate_acp(xlsx_bytes, acp_log)
@@ -970,80 +823,55 @@ if page == "Importer le fichier Export ERP":
             with st.spinner("Generation du feed Google Merchant Center..."):
                 gmc_df, gmc_stats, gmc_removed = generate_gmc(xlsx_bytes, gmc_log)
 
-            # Sauvegarder automatiquement en local
-            acp_path = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
-            acp_df.to_csv(acp_path, index=False, encoding="utf-8")
-            acp_log.append(f"Sauvegarde : {acp_path}")
+            # Sauvegarde ACP
+            save_acp_from_df(acp_df, ACP_FEED)
+            acp_log.append(f"Sauvegarde ACP : {ACP_FEED}")
 
-            gmc_files = glob.glob(GMC_PATTERN)
-            if gmc_files and gmc_df is not None:
-                with pd.ExcelWriter(gmc_files[0], engine="openpyxl") as writer:
-                    gmc_df.to_excel(writer, sheet_name="Products", index=False)
-                    if not gmc_removed.empty:
-                        gmc_removed.to_excel(writer, sheet_name="Retires", index=False)
-                gmc_log.append(f"Sauvegarde : {gmc_files[0]}")
-                if not gmc_removed.empty:
-                    gmc_log.append(f"  + {len(gmc_removed)} produits retires dans l'onglet 'Retires'")
+            # La sauvegarde GMC est déjà faite dans generate_gmc() via openpyxl
 
-            # Store in session state for persistence
-            st.session_state["acp_df"] = acp_df
-            st.session_state["gmc_df"] = gmc_df
-            st.session_state["acp_stats"] = acp_stats
-            st.session_state["gmc_stats"] = gmc_stats
-            st.session_state["acp_log"] = acp_log
-            st.session_state["gmc_log"] = gmc_log
-            st.session_state["acp_removed"] = acp_removed
-            st.session_state["gmc_removed"] = gmc_removed
-            st.session_state["generated"] = True
+            st.session_state.update({
+                "acp_df": acp_df,
+                "gmc_df": gmc_df,
+                "acp_stats": acp_stats,
+                "gmc_stats": gmc_stats,
+                "acp_log": acp_log,
+                "gmc_log": gmc_log,
+                "acp_removed": acp_removed,
+                "gmc_removed": gmc_removed,
+                "generated": True,
+            })
 
-        # --- Display results if generated ---
         if st.session_state.get("generated"):
-            acp_df = st.session_state["acp_df"]
-            gmc_df = st.session_state["gmc_df"]
-            acp_stats = st.session_state["acp_stats"]
-            gmc_stats = st.session_state["gmc_stats"]
-            acp_log = st.session_state["acp_log"]
-            gmc_log = st.session_state["gmc_log"]
+            acp_df      = st.session_state.get("acp_df", pd.DataFrame())
+            gmc_df      = st.session_state.get("gmc_df", pd.DataFrame())
+            acp_stats   = st.session_state.get("acp_stats", {})
+            gmc_stats   = st.session_state.get("gmc_stats", {})
+            acp_log     = st.session_state.get("acp_log", [])
+            gmc_log     = st.session_state.get("gmc_log", [])
             acp_removed = st.session_state.get("acp_removed", pd.DataFrame())
             gmc_removed = st.session_state.get("gmc_removed", pd.DataFrame())
 
             st.markdown('<div class="success-box">Mise a jour terminee — fichiers sauvegardes automatiquement</div>', unsafe_allow_html=True)
 
-            # --- Stats ---
+            # Stats
             st.markdown('<h2 class="section-title">Resultats</h2>', unsafe_allow_html=True)
             col1, col2 = st.columns(2, gap="large")
 
             with col1:
-                st.markdown("""<div style="background:#fff;border:1px solid #E5E5E5;border-left:4px solid #89B832;border-radius:8px;padding:18px 16px 10px;">
-                <h3 style="margin:0 0 12px;font-size:16px;color:#89B832;font-family:Georgia,serif;">Feed ACP OpenAI</h3>
-                </div>""", unsafe_allow_html=True)
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total produits", acp_stats.get("total", 0))
+                st.markdown('<div style="background:#fff;border:1px solid #E5E5E5;border-left:4px solid #89B832;border-radius:8px;padding:18px 16px 10px;"><h3 style="margin:0 0 12px;font-size:16px;color:#89B832;font-family:Georgia,serif;">Feed ACP OpenAI</h3></div>', unsafe_allow_html=True)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Total", acp_stats.get("total", 0))
                 c2.metric("Nouveaux", f"+{acp_stats.get('nouveaux', 0)}")
                 c3.metric("Retires", f"-{acp_stats.get('retires', 0)}")
-                c4.metric("GTIN remplis", acp_stats.get("gtin", 0))
-
-                c5, c6, c7, c8 = st.columns(4)
-                c5.metric("Disponibilites", f"~{acp_stats.get('disponibilites', 0)}")
-                c6.metric("Titres", f"~{acp_stats.get('titres', 0)}")
-                c7.metric("Images", f"~{acp_stats.get('images', 0)}")
-                c8.metric("URLs", f"~{acp_stats.get('urls', 0)}")
 
             with col2:
-                st.markdown("""<div style="background:#fff;border:1px solid #E5E5E5;border-left:4px solid #1A1A1A;border-radius:8px;padding:18px 16px 10px;">
-                <h3 style="margin:0 0 12px;font-size:16px;color:#1A1A1A;font-family:Georgia,serif;">Feed Google Merchant Center</h3>
-                </div>""", unsafe_allow_html=True)
+                st.markdown('<div style="background:#fff;border:1px solid #E5E5E5;border-left:4px solid #1A1A1A;border-radius:8px;padding:18px 16px 10px;"><h3 style="margin:0 0 12px;font-size:16px;color:#1A1A1A;font-family:Georgia,serif;">Feed Google Merchant Center</h3></div>', unsafe_allow_html=True)
                 if gmc_df is not None:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Total produits", gmc_stats.get("total", 0))
-                    c2.metric("Nouveaux", f"+{gmc_stats.get('nouveaux', 0)}")
-                    c3.metric("Retires", f"-{gmc_stats.get('retires', 0)}")
+                    g1, g2, g3 = st.columns(3)
+                    g1.metric("Total", gmc_stats.get("total", 0))
+                    g2.metric("Nouveaux", f"+{gmc_stats.get('nouveaux', 0)}")
+                    g3.metric("Retires", f"-{gmc_stats.get('retires', 0)}")
 
-                    c4, c5 = st.columns(2)
-                    c4.metric("Disponibilites", f"~{gmc_stats.get('disponibilites', 0)}")
-                    c5.metric("Titres", f"~{gmc_stats.get('titres', 0)}")
-
-            # Logs
             with st.expander("Journal des operations", expanded=False):
                 st.markdown("**ACP:**")
                 for line in acp_log:
@@ -1053,167 +881,135 @@ if page == "Importer le fichier Export ERP":
                     st.text(line)
 
             st.markdown("---")
-
-            # ============================
-            # APERCU DES DONNEES GENEREES
-            # ============================
             st.markdown('<h2 class="section-title">Apercu des donnees generees</h2>', unsafe_allow_html=True)
 
             tab_names = ["ACP OpenAI Feed", "Google Merchant Center"]
             if not gmc_removed.empty:
                 tab_names.append(f"Produits retires ({len(gmc_removed)})")
             tabs = st.tabs(tab_names)
-            tab_acp = tabs[0]
-            tab_gmc = tabs[1]
 
-            # --- ACP Preview Tab ---
-            with tab_acp:
-                st.markdown(f"**{len(acp_df)} produits, {len(acp_df.columns)} colonnes**")
+            # ── Onglet ACP (BUG 11 corrigé) ──────────────────────────────
+            with tabs[0]:
+                if not acp_df.empty:
+                    st.markdown(f"**{len(acp_df)} produits, {len(acp_df.columns)} colonnes**")
+                    acp_sub1, acp_sub2, acp_sub3, acp_sub4 = st.tabs([
+                        "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
+                    ])
+                    with acp_sub1:
+                        all_acp_cols = list(acp_df.columns)
+                        acp_sel = st.multiselect("Colonnes a afficher", all_acp_cols, default=all_acp_cols, key="gen_acp_cols")
+                        search_acp = st.text_input("Rechercher", key="gen_acp_search")
+                        d = acp_df[acp_sel] if acp_sel else acp_df
+                        if search_acp:
+                            d = d[d.apply(lambda r: r.astype(str).str.contains(search_acp, case=False).any(), axis=1)]
+                        st.dataframe(d, use_container_width=True, height=450)
+                        st.caption(f"{len(d)} lignes")
+                    with acp_sub2:
+                        fill = column_fill_stats(acp_df)
+                        m1, m2 = st.columns(2)
+                        m1.metric("Colonnes remplies", f"{(fill['Vide']=='Non').sum()}/{len(acp_df.columns)}")
+                        m2.metric("Colonnes vides", f"{(fill['Vide']=='Oui').sum()}/{len(acp_df.columns)}")
+                        st.dataframe(fill, use_container_width=True, height=450)
+                    with acp_sub3:
+                        avail = availability_stats(acp_df)
+                        if not avail.empty:
+                            html_bar_chart(avail["Statut"].tolist(), avail["Nombre"].tolist())
+                            st.dataframe(avail, use_container_width=True)
+                    with acp_sub4:
+                        ps = price_stats(acp_df, "price")
+                        if ps:
+                            pcols = st.columns(len(ps))
+                            for i, (k, v) in enumerate(ps.items()):
+                                pcols[i].metric(k, v)
+                else:
+                    st.info("Aucune donnee ACP generee")
 
-                acp_sub1, acp_sub2, acp_sub3, acp_sub4 = st.tabs([
-                    "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
-                ])
-
-                with acp_sub1:
-                    default_cols = ["item_id", "title", "price", "availability", "gtin", "brand", "image_url"]
-                    available_cols = [c for c in default_cols if c in acp_df.columns]
-                    selected_cols = st.multiselect(
-                        "Colonnes a afficher",
-                        options=list(acp_df.columns),
-                        default=available_cols,
-                        key="acp_cols",
-                    )
-                    if selected_cols:
-                        search = st.text_input("Rechercher un produit (ID ou titre)", key="acp_search")
-                        display_df = acp_df[selected_cols]
-                        if search:
-                            mask = display_df.apply(lambda row: row.astype(str).str.contains(search, case=False).any(), axis=1)
-                            display_df = display_df[mask]
-                        st.dataframe(display_df, width="stretch", height=450)
-                        st.caption(f"{len(display_df)} lignes affichees")
-
-                with acp_sub2:
-                    fill_df = column_fill_stats(acp_df)
-                    filled_count = (fill_df["Vide"] == "Non").sum()
-                    empty_count = (fill_df["Vide"] == "Oui").sum()
-                    m1, m2 = st.columns(2)
-                    m1.metric("Colonnes remplies", f"{filled_count}/77")
-                    m2.metric("Colonnes vides", f"{empty_count}/77")
-                    st.dataframe(fill_df, width="stretch", height=450)
-
-                with acp_sub3:
-                    avail = availability_stats(acp_df)
-                    if not avail.empty:
-                        html_bar_chart(avail["Statut"].tolist(), avail["Nombre"].tolist())
-                        st.dataframe(avail, width="stretch")
-
-                with acp_sub4:
-                    pstats = price_stats(acp_df, "price")
-                    if pstats:
-                        cols = st.columns(len(pstats))
-                        for i, (k, v) in enumerate(pstats.items()):
-                            cols[i].metric(k, v)
-                        prices = pd.to_numeric(acp_df["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
-                        html_histogram(prices)
-
-            # --- GMC Preview Tab ---
-            with tab_gmc:
-                if gmc_df is not None:
+            # ── Onglet GMC ────────────────────────────────────────────────
+            with tabs[1]:
+                if gmc_df is not None and not gmc_df.empty:
                     st.markdown(f"**{len(gmc_df)} produits, {len(gmc_df.columns)} colonnes**")
-
                     gmc_sub1, gmc_sub2, gmc_sub3, gmc_sub4 = st.tabs([
                         "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
                     ])
-
                     with gmc_sub1:
-                        gmc_default = ["id", "title", "price", "availability", "gtin", "brand", "image link"]
-                        gmc_avail = [c for c in gmc_default if c in gmc_df.columns]
-                        gmc_selected = st.multiselect(
-                            "Colonnes a afficher",
-                            options=list(gmc_df.columns),
-                            default=gmc_avail,
-                            key="gmc_cols",
-                        )
-                        if gmc_selected:
-                            search_gmc = st.text_input("Rechercher un produit (ID ou titre)", key="gmc_search")
-                            display_gmc = gmc_df[gmc_selected]
-                            if search_gmc:
-                                mask = display_gmc.apply(lambda row: row.astype(str).str.contains(search_gmc, case=False).any(), axis=1)
-                                display_gmc = display_gmc[mask]
-                            st.dataframe(display_gmc, width="stretch", height=450)
-                            st.caption(f"{len(display_gmc)} lignes affichees")
-
+                        all_gmc_cols = list(gmc_df.columns)
+                        gmc_sel = st.multiselect("Colonnes a afficher", all_gmc_cols, default=all_gmc_cols, key="gen_gmc_cols")
+                        search_gmc = st.text_input("Rechercher", key="gen_gmc_search")
+                        dg = gmc_df[gmc_sel] if gmc_sel else gmc_df
+                        if search_gmc:
+                            dg = dg[dg.apply(lambda r: r.astype(str).str.contains(search_gmc, case=False).any(), axis=1)]
+                        st.dataframe(dg, use_container_width=True, height=450)
+                        st.caption(f"{len(dg)} lignes")
                     with gmc_sub2:
-                        gmc_fill = column_fill_stats(gmc_df)
-                        filled_g = (gmc_fill["Vide"] == "Non").sum()
-                        empty_g = (gmc_fill["Vide"] == "Oui").sum()
+                        gfill = column_fill_stats(gmc_df)
                         m1, m2 = st.columns(2)
-                        m1.metric("Colonnes remplies", f"{filled_g}/{len(gmc_df.columns)}")
-                        m2.metric("Colonnes vides", f"{empty_g}/{len(gmc_df.columns)}")
-                        st.dataframe(gmc_fill, width="stretch", height=450)
-
+                        m1.metric("Colonnes remplies", f"{(gfill['Vide']=='Non').sum()}/{len(gmc_df.columns)}")
+                        m2.metric("Colonnes vides", f"{(gfill['Vide']=='Oui').sum()}/{len(gmc_df.columns)}")
+                        st.dataframe(gfill, use_container_width=True, height=450)
                     with gmc_sub3:
                         gavail = availability_stats(gmc_df)
                         if not gavail.empty:
                             html_bar_chart(gavail["Statut"].tolist(), gavail["Nombre"].tolist())
-                            st.dataframe(gavail, width="stretch")
-
+                            st.dataframe(gavail, use_container_width=True)
                     with gmc_sub4:
-                        gpstats = price_stats(gmc_df, "price")
-                        if gpstats:
-                            cols = st.columns(len(gpstats))
-                            for i, (k, v) in enumerate(gpstats.items()):
-                                cols[i].metric(k, v)
-                            prices_g = pd.to_numeric(gmc_df["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
+                        gps = price_stats(gmc_df, "price")
+                        if gps:
+                            gpcols = st.columns(len(gps))
+                            for i, (k, v) in enumerate(gps.items()):
+                                gpcols[i].metric(k, v)
+                            prices_g = pd.to_numeric(
+                                gmc_df["price"].str.replace(r"\s*EUR\s*$","",regex=True).str.replace(",",".").str.replace(r"[^\d.]","",regex=True),
+                                errors="coerce"
+                            ).dropna()
                             html_histogram(prices_g)
                 else:
-                    st.warning("Fichier GMC non genere")
+                    st.warning("Fichier GMC non genere ou introuvable")
 
-            # --- Tab Retires ---
+            # ── Onglet Produits retirés ───────────────────────────────────
             if not gmc_removed.empty and len(tabs) > 2:
                 with tabs[2]:
-                    st.markdown(f"**{len(gmc_removed)} produits retires** (presents dans GMC/ACP mais absents de l'export ERP)")
+                    st.markdown(f"**{len(gmc_removed)} produits retires**")
                     default_ret = ["id", "title", "price", "availability", "gtin", "brand"]
                     avail_ret = [c for c in default_ret if c in gmc_removed.columns]
-                    st.dataframe(gmc_removed[avail_ret] if avail_ret else gmc_removed, width="stretch", height=450)
+                    st.dataframe(gmc_removed[avail_ret] if avail_ret else gmc_removed, use_container_width=True, height=450)
 
             st.markdown("---")
-
-            # ============================
-            # DOWNLOADS
-            # ============================
             st.markdown('<h2 class="section-title">Telecharger</h2>', unsafe_allow_html=True)
             dl1, dl2 = st.columns(2)
 
             with dl1:
-                acp_csv = acp_df.to_csv(index=False, encoding="utf-8")
+                # Lire le fichier sauvegardé directement (source de vérité)
+                if os.path.exists(ACP_FEED):
+                    with open(ACP_FEED, "rb") as _fa:
+                        acp_raw = _fa.read()
+                else:
+                    acp_raw = acp_df.to_csv(index=False, encoding="utf-8").encode("utf-8")
                 st.download_button(
                     label="ACP_OpenAI_Feed.csv",
-                    data=acp_csv,
+                    data=acp_raw,
                     file_name="ACP_OpenAI_Feed.csv",
                     mime="text/csv",
-                    width="stretch",
+                    use_container_width=True,
                 )
 
             with dl2:
-                if gmc_df is not None:
+                if gmc_df is not None and not gmc_df.empty:
                     gmc_buffer = io.BytesIO()
                     with pd.ExcelWriter(gmc_buffer, engine="openpyxl") as writer:
                         gmc_df.to_excel(writer, sheet_name="Products", index=False)
                         if not gmc_removed.empty:
                             gmc_removed.to_excel(writer, sheet_name="Retires", index=False)
-                    gmc_buffer.seek(0)
+                    gmc_buffer.seek(0)   # BUG 10 corrigé
                     st.download_button(
                         label="Flux Google Merchant Center.xlsx",
                         data=gmc_buffer,
                         file_name="Flux Google Merchant Center - Products source.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        width="stretch",
+                        use_container_width=True,
                     )
-
-
     else:
         st.info("Importez un fichier export-variants (.xlsx) pour commencer")
+
 
 # ============================================================
 # PAGE 2 : Apercu des fichiers actuels
@@ -1222,112 +1018,98 @@ elif page == "Apercu des fichiers actuels":
 
     st.markdown('<h2 class="section-title">Etat actuel des fichiers</h2>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
+
+    acp_full = pd.DataFrame()
+    gmc_full = pd.DataFrame()
+
     with col1:
-        acp_path = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
-        if os.path.exists(acp_path):
-            acp_full = pd.read_csv(acp_path, dtype=str, keep_default_na=False)
+        acp_full = load_acp_as_df(ACP_FEED)
+        if not acp_full.empty:
             st.metric("ACP Feed", f"{len(acp_full)} produits, {len(acp_full.columns)} colonnes")
         else:
-            st.warning("ACP_OpenAI_Feed.csv introuvable")
+            st.warning("ACP_OpenAI_Feed.csv introuvable dans 'Files to update'")
+
     with col2:
         gmc_path = find_gmc_file()
         if gmc_path:
-            gmc = pd.read_excel(gmc_path, dtype=str)
-            st.metric("GMC Feed", f"{len(gmc)} produits, {len(gmc.columns)} colonnes")
+            gmc_full = load_gmc_as_df(gmc_path)
+            st.metric("GMC Feed", f"{len(gmc_full)} produits, {len(gmc_full.columns)} colonnes")
         else:
-            st.warning("GMC XLSX introuvable")
+            st.warning("GMC XLSX introuvable dans 'Files to update'")
 
-    # Download buttons
     dl1, dl2 = st.columns(2)
     with dl1:
-        if os.path.exists(acp_path):
-            acp_data = acp_full.to_csv(index=False, encoding="utf-8")
+        if not acp_full.empty and os.path.exists(ACP_FEED):
+            with open(ACP_FEED, "rb") as _fa:
+                acp_raw_bytes = _fa.read()
             st.download_button(
                 label="Telecharger ACP_OpenAI_Feed.csv",
-                data=acp_data,
+                data=acp_raw_bytes,
                 file_name="ACP_OpenAI_Feed.csv",
                 mime="text/csv",
                 key="dl_acp_apercu",
+                use_container_width=True,
             )
     with dl2:
-        if gmc_path:
-            gmc_buf = io.BytesIO()
-            with pd.ExcelWriter(gmc_buf, engine="openpyxl") as writer:
-                gmc.to_excel(writer, sheet_name="Products", index=False)
+        if gmc_path and not gmc_full.empty:
+            # Télécharger le fichier original directement (préserve les HYPERLINK headers)
+            with open(gmc_path, "rb") as _f:
+                gmc_raw_bytes = _f.read()
             st.download_button(
                 label="Telecharger GMC.xlsx",
-                data=gmc_buf.getvalue(),
+                data=gmc_raw_bytes,
                 file_name=os.path.basename(gmc_path),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_gmc_apercu",
+                use_container_width=True,
             )
 
     st.markdown("---")
 
     cur_tab1, cur_tab2 = st.tabs(["ACP OpenAI Feed", "Google Merchant Center"])
 
-    # ==================== ACP TAB ====================
     with cur_tab1:
-        acp_path = os.path.join(BASE_DIR, "ACP_OpenAI_Feed.csv")
-        if os.path.exists(acp_path):
-            cur_acp = pd.read_csv(acp_path, dtype=str, keep_default_na=False)
+        if not acp_full.empty:
+            cur_acp = acp_full.copy()   # déjà chargé via load_acp_as_df
             st.markdown(f"**{len(cur_acp)} produits, {len(cur_acp.columns)} colonnes**")
-
             acp_mode = st.radio("Mode", ["Consulter", "Modifier"], horizontal=True, key="acp_mode")
 
             if acp_mode == "Consulter":
-                c_sub1, c_sub2, c_sub3, c_sub4 = st.tabs([
-                    "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
-                ])
-
+                c_sub1, c_sub2, c_sub3, c_sub4 = st.tabs(["Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"])
                 with c_sub1:
-                    cur_default = ["item_id", "title", "price", "availability", "gtin", "brand", "image_url"]
-                    cur_avail = [c for c in cur_default if c in cur_acp.columns]
-                    cur_sel = st.multiselect(
-                        "Colonnes a afficher", list(cur_acp.columns), default=cur_avail, key="cur_acp_cols"
-                    )
-                    if cur_sel:
-                        cur_search = st.text_input("Rechercher", key="cur_acp_search")
-                        d = cur_acp[cur_sel]
-                        if cur_search:
-                            d = d[d.apply(lambda r: r.astype(str).str.contains(cur_search, case=False).any(), axis=1)]
-                        st.dataframe(d, width="stretch", height=450)
-                        st.caption(f"{len(d)} lignes")
-
+                    all_cols = list(cur_acp.columns)
+                    sel = st.multiselect("Colonnes a afficher", all_cols, default=all_cols, key="cur_acp_cols")
+                    search = st.text_input("Rechercher", key="cur_acp_search")
+                    d = cur_acp[sel] if sel else cur_acp
+                    if search:
+                        d = d[d.apply(lambda r: r.astype(str).str.contains(search, case=False).any(), axis=1)]
+                    st.dataframe(d, use_container_width=True, height=450)
+                    st.caption(f"{len(d)} lignes")
                 with c_sub2:
-                    fill_cur = column_fill_stats(cur_acp)
-                    filled_c = (fill_cur["Vide"] == "Non").sum()
-                    empty_c = (fill_cur["Vide"] == "Oui").sum()
+                    fill = column_fill_stats(cur_acp)
                     m1, m2 = st.columns(2)
-                    m1.metric("Colonnes remplies", f"{filled_c}/{len(cur_acp.columns)}")
-                    m2.metric("Colonnes vides", f"{empty_c}/{len(cur_acp.columns)}")
-                    st.dataframe(fill_cur, width="stretch", height=450)
-
+                    m1.metric("Colonnes remplies", f"{(fill['Vide']=='Non').sum()}/{len(cur_acp.columns)}")
+                    m2.metric("Colonnes vides", f"{(fill['Vide']=='Oui').sum()}/{len(cur_acp.columns)}")
+                    st.dataframe(fill, use_container_width=True, height=450)
                 with c_sub3:
                     avail_c = availability_stats(cur_acp)
                     if not avail_c.empty:
                         html_bar_chart(avail_c["Statut"].tolist(), avail_c["Nombre"].tolist())
-                        st.dataframe(avail_c, width="stretch")
-
+                        st.dataframe(avail_c, use_container_width=True)
                 with c_sub4:
                     ps = price_stats(cur_acp, "price")
                     if ps:
-                        cols = st.columns(len(ps))
+                        pcols = st.columns(len(ps))
                         for i, (k, v) in enumerate(ps.items()):
-                            cols[i].metric(k, v)
-                        prices_cur = pd.to_numeric(cur_acp["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
-                        html_histogram(prices_cur)
+                            pcols[i].metric(k, v)
 
             else:  # Modifier
-                st.markdown("""<div style="background:#fff8e1;border:1px solid #f9a825;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#6d4c00;">
-                Modifiez les cellules directement dans le tableau. Cliquez sur <b>Sauvegarder</b> pour enregistrer.
-                </div>""", unsafe_allow_html=True)
-
+                st.markdown('<div style="background:#fff8e1;border:1px solid #f9a825;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#6d4c00;">Modifiez les cellules directement dans le tableau. Cliquez sur <b>Sauvegarder</b> pour enregistrer.</div>', unsafe_allow_html=True)
                 edit_search = st.text_input("Filtrer par SKU ou titre", key="acp_edit_search")
                 edit_cols = st.multiselect(
                     "Colonnes a modifier",
                     list(cur_acp.columns),
-                    default=["item_id", "title", "description", "price", "sale_price", "availability", "gtin", "image_url"],
+                    default=[c for c in ["item_id","title","description","price","sale_price","availability","gtin","image_url"] if c in cur_acp.columns],
                     key="acp_edit_cols",
                 )
                 if edit_cols:
@@ -1338,21 +1120,13 @@ elif page == "Apercu des fichiers actuels":
                         edit_df = edit_df.loc[edit_idx]
                     else:
                         edit_idx = edit_df.index
-
-                    edited = st.data_editor(
-                        edit_df,
-                        use_container_width=True,
-                        height=500,
-                        num_rows="fixed",
-                        key="acp_editor",
-                    )
-
+                    edited = st.data_editor(edit_df, use_container_width=True, height=500, num_rows="fixed", key="acp_editor")
                     b1, b2 = st.columns([1, 4])
                     with b1:
                         if st.button("Sauvegarder ACP", type="primary", key="save_acp"):
                             for col in edit_cols:
                                 cur_acp.loc[edit_idx, col] = edited[col].values
-                            cur_acp.to_csv(acp_path, index=False, encoding="utf-8")
+                            save_acp_from_df(cur_acp, ACP_FEED)
                             st.success(f"ACP sauvegarde ({len(cur_acp)} produits)")
                             st.rerun()
                     with b2:
@@ -1360,68 +1134,55 @@ elif page == "Apercu des fichiers actuels":
         else:
             st.info("Aucun fichier ACP trouve")
 
-    # ==================== GMC TAB ====================
     with cur_tab2:
         gmc_path = find_gmc_file()
         if gmc_path:
-            cur_gmc = pd.read_excel(gmc_path, dtype=str, keep_default_na=False)
+            cur_gmc = load_gmc_as_df(gmc_path)   # préserve les labels HYPERLINK
             st.markdown(f"**{len(cur_gmc)} produits, {len(cur_gmc.columns)} colonnes**")
-
             gmc_mode = st.radio("Mode", ["Consulter", "Modifier"], horizontal=True, key="gmc_mode")
 
             if gmc_mode == "Consulter":
-                g_sub1, g_sub2, g_sub3, g_sub4 = st.tabs([
-                    "Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"
-                ])
-
+                g_sub1, g_sub2, g_sub3, g_sub4 = st.tabs(["Tableau", "Colonnes & Remplissage", "Disponibilite", "Prix"])
                 with g_sub1:
-                    gmc_def = ["id", "title", "price", "availability", "gtin", "brand", "image link"]
-                    gmc_av = [c for c in gmc_def if c in cur_gmc.columns]
-                    gmc_sel = st.multiselect(
-                        "Colonnes a afficher", list(cur_gmc.columns), default=gmc_av, key="cur_gmc_cols"
-                    )
-                    if gmc_sel:
-                        g_search = st.text_input("Rechercher", key="cur_gmc_search")
-                        dg = cur_gmc[gmc_sel]
-                        if g_search:
-                            dg = dg[dg.apply(lambda r: r.astype(str).str.contains(g_search, case=False).any(), axis=1)]
-                        st.dataframe(dg, width="stretch", height=450)
-                        st.caption(f"{len(dg)} lignes")
-
+                    all_g = list(cur_gmc.columns)
+                    gsel = st.multiselect("Colonnes a afficher", all_g, default=all_g, key="cur_gmc_cols")
+                    gsearch = st.text_input("Rechercher", key="cur_gmc_search")
+                    dg = cur_gmc[gsel] if gsel else cur_gmc
+                    if gsearch:
+                        dg = dg[dg.apply(lambda r: r.astype(str).str.contains(gsearch, case=False).any(), axis=1)]
+                    st.dataframe(dg, use_container_width=True, height=450)
+                    st.caption(f"{len(dg)} lignes")
                 with g_sub2:
-                    gmc_fill = column_fill_stats(cur_gmc)
-                    filled_g = (gmc_fill["Vide"] == "Non").sum()
-                    empty_g = (gmc_fill["Vide"] == "Oui").sum()
+                    gfill = column_fill_stats(cur_gmc)
                     m1, m2 = st.columns(2)
-                    m1.metric("Colonnes remplies", f"{filled_g}/{len(cur_gmc.columns)}")
-                    m2.metric("Colonnes vides", f"{empty_g}/{len(cur_gmc.columns)}")
-                    st.dataframe(gmc_fill, width="stretch", height=450)
-
+                    m1.metric("Colonnes remplies", f"{(gfill['Vide']=='Non').sum()}/{len(cur_gmc.columns)}")
+                    m2.metric("Colonnes vides", f"{(gfill['Vide']=='Oui').sum()}/{len(cur_gmc.columns)}")
+                    st.dataframe(gfill, use_container_width=True, height=450)
                 with g_sub3:
-                    gavail_c = availability_stats(cur_gmc)
-                    if not gavail_c.empty:
-                        html_bar_chart(gavail_c["Statut"].tolist(), gavail_c["Nombre"].tolist())
-                        st.dataframe(gavail_c, width="stretch")
-
+                    gavail = availability_stats(cur_gmc)
+                    if not gavail.empty:
+                        html_bar_chart(gavail["Statut"].tolist(), gavail["Nombre"].tolist())
+                        st.dataframe(gavail, use_container_width=True)
                 with g_sub4:
                     gps = price_stats(cur_gmc, "price")
                     if gps:
-                        cols = st.columns(len(gps))
+                        gpcols = st.columns(len(gps))
                         for i, (k, v) in enumerate(gps.items()):
-                            cols[i].metric(k, v)
-                        prices_gmc_cur = pd.to_numeric(cur_gmc["price"].str.replace(r"\s*EUR\s*$", "", regex=True).str.replace(",", ".").str.replace(r"[^\d.]", "", regex=True), errors="coerce").dropna()
-                        html_histogram(prices_gmc_cur)
+                            gpcols[i].metric(k, v)
+                        prices_cur = pd.to_numeric(
+                            cur_gmc["price"].str.replace(r"\s*EUR\s*$","",regex=True).str.replace(",",".").str.replace(r"[^\d.]","",regex=True),
+                            errors="coerce"
+                        ).dropna()
+                        html_histogram(prices_cur)
 
             else:  # Modifier
-                st.markdown("""<div style="background:#fff8e1;border:1px solid #f9a825;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#6d4c00;">
-                Modifiez les cellules directement dans le tableau. Cliquez sur <b>Sauvegarder</b> pour enregistrer.
-                </div>""", unsafe_allow_html=True)
-
+                st.markdown('<div style="background:#fff8e1;border:1px solid #f9a825;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#6d4c00;">Modifiez les cellules directement dans le tableau. Cliquez sur <b>Sauvegarder</b> pour enregistrer.</div>', unsafe_allow_html=True)
                 gedit_search = st.text_input("Filtrer par SKU ou titre", key="gmc_edit_search")
+                gmc_edit_defaults = ["id", "title", "description", "price", "sale price", "availability", "gtin", "image link"]
                 gedit_cols = st.multiselect(
                     "Colonnes a modifier",
                     list(cur_gmc.columns),
-                    default=["id", "title", "description", "price", "sale price", "availability", "gtin", "image link"],
+                    default=[c for c in gmc_edit_defaults if c in cur_gmc.columns],
                     key="gmc_edit_cols",
                 )
                 if gedit_cols:
@@ -1432,22 +1193,13 @@ elif page == "Apercu des fichiers actuels":
                         gedit_df = gedit_df.loc[gedit_idx]
                     else:
                         gedit_idx = gedit_df.index
-
-                    gedited = st.data_editor(
-                        gedit_df,
-                        use_container_width=True,
-                        height=500,
-                        num_rows="fixed",
-                        key="gmc_editor",
-                    )
-
+                    gedited = st.data_editor(gedit_df, use_container_width=True, height=500, num_rows="fixed", key="gmc_editor")
                     gb1, gb2 = st.columns([1, 4])
                     with gb1:
                         if st.button("Sauvegarder GMC", type="primary", key="save_gmc"):
                             for col in gedit_cols:
                                 cur_gmc.loc[gedit_idx, col] = gedited[col].values
-                            with pd.ExcelWriter(gmc_path, engine="openpyxl") as writer:
-                                cur_gmc.to_excel(writer, sheet_name="Products", index=False)
+                            save_gmc_from_df(cur_gmc, gmc_path)   # préserve les HYPERLINK headers
                             st.success(f"GMC sauvegarde ({len(cur_gmc)} produits)")
                             st.rerun()
                     with gb2:
